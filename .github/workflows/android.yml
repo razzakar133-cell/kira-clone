@@ -29,6 +29,26 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Inject Google client secret
+        run: |
+          if [ -z "$GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::GOOGLE_CLIENT_SECRET repo secret is not set. Add it in repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          grep -q "const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';" src/main.js || { echo "::error::Placeholder assignment not found in src/main.js"; exit 1; }
+          python3 - <<'PY'
+          import os
+          p = 'src/main.js'
+          s = open(p, encoding='utf-8').read()
+          s = s.replace(
+              "const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';",
+              "const GOOGLE_CLIENT_SECRET_DEFAULT = '" + os.environ['GOOGLE_CLIENT_SECRET'] + "';", 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('Google client secret injected.')
+          PY
+        env:
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+
       - name: Build web app
         run: npm run build
 
