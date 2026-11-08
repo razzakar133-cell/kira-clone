@@ -348,6 +348,7 @@ const INTEGRATIONS = [
   { id: 'google', name: 'Google', icon: '🔍' }, { id: 'gmail', name: 'Gmail', icon: '✉️' },
   { id: 'drive', name: 'Google Drive', icon: '💾' }, { id: 'gcal', name: 'Google Calendar', icon: '📅' },
   { id: 'slack', name: 'Slack', icon: '💬' }, { id: 'notion', name: 'Notion', icon: '📝' },
+  { id: 'jewel', name: 'Jewel — your personal agent', icon: '💎', link: 'https://muse.ai' },
 ];
 const SOCIALS = [
   { id: 'linkedin', name: 'LinkedIn', cls: 'background:#e8f0fe;color:#0a66c2' },
@@ -970,6 +971,10 @@ const MODULES = {
       const con = store.get('integrations', {});
       const gt = googleTokens();
       return `<div class="card">${INTEGRATIONS.map(i => {
+        if (i.link) {
+          return `<div class="list-item"><div><div class="t">${i.icon} ${i.name}</div><div class="s">Your personal AI agent — tap to open chat</div></div>
+        <button class="btn small" data-act="int-open" data-v="${i.id}">Open</button></div>`;
+        }
         const isGoogle = GOOGLE_IDS.includes(i.id);
         const real = isGoogle && con[i.id] === 'google' && gt;
         const demo = con[i.id] === 'demo';
@@ -978,7 +983,7 @@ const MODULES = {
         return `<div class="list-item"><div><div class="t">${i.icon} ${i.name}</div><div class="s">${status}</div></div>
         <button class="btn ${real || demo ? 'ghost' : ''} small" data-act="int-connect" data-v="${i.id}">${btn}</button></div>`;
       }).join('')}</div>
-      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Slack and Notion are demo connections — real access would need their official OAuth.</div>`;
+      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Slack and Notion are demo connections — real access would need their official OAuth. Jewel opens your personal agent chat (muse.ai) — the app that solves the problems this app cannot.</div>`;
     },
   },
   workflows: {
@@ -1654,6 +1659,13 @@ const ACTS = {
       return;
     }
     const c = store.get('integrations', {}); if (c[id]) delete c[id]; else c[id] = 'demo'; store.set('integrations', c); render();
+  },
+  'int-open'(el) {
+    const it = INTEGRATIONS.find(x => x.id === el.dataset.v);
+    if (!it || !it.link) return;
+    toast('Opening Jewel — your personal agent.');
+    if (isNativeApp()) { Browser.open({ url: it.link }).catch(() => {}); }
+    else { try { window.open(it.link, '_blank'); } catch {} }
   },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
