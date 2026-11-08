@@ -1,7 +1,13 @@
 /* Kira clone — personal AI assistant app (local build, inspired by the Kira app UI).
    All data lives in localStorage (keys prefixed kira_). AI chat uses the user's
    own free Gemini API key. Real booking / payment / phone calls are NOT possible
-   from an app alone — those modules plan and save locally and say so honestly. */
+   from an app alone — those modules plan and save locally and say so honestly.
+   Google sign-in below is REAL OAuth (PKCE, Web application client) — it needs
+   a Google Cloud OAuth client ID + client secret (see GOOGLE_CLIENT_ID_DEFAULT
+   and GOOGLE_CLIENT_SECRET_DEFAULT). The secret is injected at build time from
+   the GOOGLE_CLIENT_SECRET repo secret and never committed. */
+import { Browser } from '@capacitor/browser';
+
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -66,6 +72,237 @@ function templateReply(text) {
   return 'I understood: "' + text + '". To give you a full AI answer, add your free Gemini API key in Settings (gear icon). Without a key I can still open any tool for you — try Smart Calendar, Meal Planner, Travel Planner, Homework or Image Gen from the More menu.';
 }
 
+/* ---------- Google OAuth (real sign-in, PKCE, Web application client) ----------
+   HOW TO SET IT UP (one time, in Google Cloud Console):
+   1. Use the existing "Kira Clone" project, configure the OAuth consent screen
+      (External, Testing mode) and keep the user's Google account as a test user
+      (unverified apps can only be used by test users).
+   2. Credentials → Create OAuth client ID → Application type: Web application.
+      Authorized redirect URI (exact):
+        https://razzakar133-cell.github.io/kira-clone/oauth.html
+   3. Paste the resulting client ID (…apps.googleusercontent.com) in
+      Settings → Google OAuth client ID inside the app, and put the client
+      secret (GOCSPX-…) in the GOOGLE_CLIENT_SECRET repo secret (GitHub →
+      repo Settings → Secrets and variables → Actions). The build injects the
+      secret into the app bundle; it is never committed to the repo.
+   HOW SIGN-IN WORKS: Connect opens the Google sign-in page in the system
+   browser; Google redirects to oauth.html (a static page on GitHub Pages)
+   which shows the authorization code. The user copies that code and pastes
+   it into the app's Google Sign-in screen, which exchanges it for tokens.
+   Until the client ID + secret are set, Connect shows "not configured yet"
+   and nothing is sent anywhere. Tokens are stored on this device only
+   (kira_google_tokens). Scopes are read-only: openid, email, profile,
+   gmail.readonly, drive.readonly, calendar.readonly. */
+const GOOGLE_CLIENT_ID_DEFAULT = '419209461444-5sil155htgnd107qov73vssa7g4gajtb.apps.googleusercontent.com';
+const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';
+const GOOGLE_REDIRECT_URI = 'https://razzakar133-cell.github.io/kira-clone/oauth.html';
+const GOOGLE_SCOPES = ['openid', 'email', 'profile',
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/calendar.readonly'];
+const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
+const GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo';
+const GOOGLE_IDS = ['google', 'gmail', 'drive', 'gcal'];
+const googleClientId = () => { const v = (store.get('google_client_id', '') || '').trim(); return v || GOOGLE_CLIENT_ID_DEFAULT; };
+/* Secret resolution: built-in value injected at build time wins; otherwise the
+   secret saved in Settings (device only); otherwise unconfigured. The built-in
+   placeholder '__GOOGLE_CLIENT_SECRET__' counts as "not set". */
+function resolveGoogleSecret(builtin, stored) {
+  const b = (builtin || '').trim();
+  if (b && b !== '__GOOGLE_CLIENT_SECRET__') return b;
+  return (stored || '').trim();
+}
+const googleClientSecret = () => resolveGoogleSecret(GOOGLE_CLIENT_SECRET_DEFAULT, store.get('google_client_secret', ''));
+const googleBuiltInSecretActive = () => { const b = (GOOGLE_CLIENT_SECRET_DEFAULT || '').trim(); return !!b && b !== '__GOOGLE_CLIENT_SECRET__'; };
+const isGoogleConfigured = () => {
+  const id = googleClientId();
+  return !!id && id !== 'PASTE_WEB_CLIENT_ID_HERE' && !!googleClientSecret();
+};
+const googleTokens = () => store.get('google_tokens', null);
+const isGoogleSignedIn = () => { const t = googleTokens(); return !!(t && (t.refresh_token || t.access_token)); };
+
+/* SHA-256 (pure JS fallback — crypto.subtle is missing in some WebViews/jsdom).
+   Verified against Node crypto and the RFC 7636 PKCE test vector. */
+/* UTF-8 encode without depending on TextEncoder (missing in jsdom/old WebViews). */
+function utf8Bytes(str) {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
+  const bytes = [];
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i);
+    if (c < 0x80) bytes.push(c);
+    else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else if (c >= 0xd800 && c < 0xdc00) {
+      const c2 = str.charCodeAt(++i);
+      c = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+      bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    } else bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  return new Uint8Array(bytes);
+}
+/* base64url without padding, no btoa dependency. */
+function base64Url(bytes) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+    out += chars[b0 >> 2];
+    out += chars[((b0 & 3) << 4) | (b1 === undefined ? 0 : b1 >> 4)];
+    if (b1 !== undefined) out += chars[((b1 & 15) << 2) | (b2 === undefined ? 0 : b2 >> 6)];
+    if (b2 !== undefined) out += chars[b2 & 63];
+  }
+  return out;
+}
+function sha256Ascii(str) {
+  const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a, h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const bytes = utf8Bytes(str);
+  const bitLen = bytes.length * 8;
+  const padded = new Uint8Array(Math.ceil((bytes.length + 9) / 64) * 64);
+  padded.set(bytes); padded[bytes.length] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 4, bitLen >>> 0);
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+    h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+  }
+  const out = new Uint8Array(32);
+  const od = new DataView(out.buffer);
+  [h0, h1, h2, h3, h4, h5, h6, h7].forEach((v, i) => od.setUint32(i * 4, v >>> 0));
+  return out;
+}
+function makeVerifier() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+  const bytes = new Uint8Array(64);
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return Array.from(bytes, b => chars[b % chars.length]).join('');
+}
+async function pkceChallenge(verifier) {
+  try {
+    if (typeof TextEncoder !== 'undefined' && window.crypto && window.crypto.subtle && window.crypto.subtle.digest) {
+      const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+      return base64Url(new Uint8Array(digest));
+    }
+  } catch {}
+  return base64Url(sha256Ascii(verifier));
+}
+async function buildGoogleAuthUrl() {
+  const verifier = makeVerifier();
+  store.set('oauth_verifier', verifier);
+  const challenge = await pkceChallenge(verifier);
+  const params = new URLSearchParams({
+    client_id: googleClientId(),
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: 'code',
+    scope: GOOGLE_SCOPES.join(' '),
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    access_type: 'offline',
+    prompt: 'consent',
+  });
+  return GOOGLE_AUTH_URL + '?' + params.toString();
+}
+function isNativeApp() {
+  try { return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()); } catch { return false; }
+}
+async function startGoogleSignIn() {
+  if (!isGoogleConfigured()) { toast('Google sign-in is not configured yet — paste the OAuth client ID and secret in Settings.'); return; }
+  let url;
+  try { url = await buildGoogleAuthUrl(); } catch { toast('Could not start Google sign-in.'); return; }
+  state.googleManualUrl = url;
+  // Primary flow: open the Google sign-in page in the system browser.
+  // Google redirects to oauth.html, which shows the code to paste back here.
+  if (isNativeApp()) {
+    try { await Browser.open({ url }); } catch {}
+  } else {
+    try { window.open(url, '_blank'); } catch {}
+  }
+  openModule('google-signin');
+}
+function markGoogleConnected(on) {
+  const con = store.get('integrations', {});
+  GOOGLE_IDS.forEach(id => { if (on) con[id] = 'google'; else delete con[id]; });
+  store.set('integrations', con);
+}
+async function exchangeGoogleCode(code) {
+  const verifier = store.get('oauth_verifier', '');
+  if (!verifier) throw new Error('no-verifier');
+  const res = await fetch(GOOGLE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code, client_id: googleClientId(), client_secret: googleClientSecret(),
+      redirect_uri: GOOGLE_REDIRECT_URI,
+      grant_type: 'authorization_code', code_verifier: verifier,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) throw new Error(data.error_description || data.error || 'token-exchange-failed');
+  let profile = {};
+  try {
+    const r = await fetch(GOOGLE_USERINFO_URL, { headers: { Authorization: 'Bearer ' + data.access_token } });
+    if (r.ok) profile = await r.json();
+  } catch {}
+  const prev = googleTokens() || {};
+  store.set('google_tokens', {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || prev.refresh_token || '',
+    expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+    email: profile.email || prev.email || '',
+    name: profile.name || prev.name || '',
+    scope: data.scope || '',
+  });
+  store.del('oauth_verifier');
+  markGoogleConnected(true);
+  return true;
+}
+async function refreshGoogleToken() {
+  const t = googleTokens();
+  if (!t || !t.refresh_token) return null;
+  if (t.access_token && t.expires_at && Date.now() < t.expires_at - 60000) return t.access_token;
+  try {
+    const res = await fetch(GOOGLE_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: googleClientId(), client_secret: googleClientSecret(), grant_type: 'refresh_token', refresh_token: t.refresh_token }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.access_token) return null;
+    store.set('google_tokens', { ...t, access_token: data.access_token, expires_at: Date.now() + (data.expires_in || 3600) * 1000 });
+    return data.access_token;
+  } catch { return null; }
+}
+async function googleSignOut() {
+  const t = googleTokens();
+  const tok = (t && (t.refresh_token || t.access_token)) || '';
+  store.del('google_tokens');
+  markGoogleConnected(false);
+  if (tok) {
+    try { await fetch(GOOGLE_REVOKE_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: tok }) }); } catch {}
+  }
+  toast('Signed out of Google.');
+  render();
+}
 /* ---------- app state ---------- */
 const state = {
   tab: 'home',            // home | chats | voice | automate | more
@@ -80,6 +317,7 @@ const state = {
   stats: store.get('stats', { toolsUsed: 0, tasksRun: 0, turns: 0 }),
   voiceLang: store.get('voice_lang', 'bn-BD'),
   pinned: store.get('pinned', ['messages', 'smart-calendar', 'meal-planner']),
+  googleManualUrl: '', // Google auth URL shown in the sign-in module (copy link + paste code)
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -119,7 +357,10 @@ const SOCIALS = [
 ];
 
 if (typeof window !== 'undefined') {
-  window.__kira = { state, MODELS, store, callGemini, templateReply };
+  window.__kira = { state, MODELS, store, callGemini, templateReply,
+    pkceChallenge, makeVerifier, googleClientId, googleClientSecret, resolveGoogleSecret,
+    isGoogleConfigured, isGoogleSignedIn, googleTokens, exchangeGoogleCode,
+    googleSignOut, refreshGoogleToken, buildGoogleAuthUrl, GOOGLE_REDIRECT_URI, GOOGLE_IDS };
 }
 
 /* ---------- shell & router ---------- */
@@ -724,12 +965,20 @@ const MODULES = {
     },
   },
   integrations: {
-    id: 'integrations', icon: '🔌', title: 'Integrations', hint: 'Demo connections — tokens stay on this device only.',
+    id: 'integrations', icon: '🔌', title: 'Integrations', hint: 'Google sign-in is real — Slack and Notion are demo.',
     render() {
       const con = store.get('integrations', {});
-      return `<div class="card">${INTEGRATIONS.map(i => `<div class="list-item"><div><div class="t">${i.icon} ${i.name}</div><div class="s">${con[i.id] ? 'Connected (demo)' : 'Not connected'}</div></div>
-        <button class="btn ${con[i.id] ? 'ghost' : ''} small" data-act="int-connect" data-v="${i.id}">${con[i.id] ? 'Disconnect' : 'Connect'}</button></div>`).join('')}</div>
-      <div class="note">These are demo connections for the clone. Real Google / Slack / Notion access needs official OAuth, which this app does not do.</div>`;
+      const gt = googleTokens();
+      return `<div class="card">${INTEGRATIONS.map(i => {
+        const isGoogle = GOOGLE_IDS.includes(i.id);
+        const real = isGoogle && con[i.id] === 'google' && gt;
+        const demo = con[i.id] === 'demo';
+        const status = real ? 'Connected · ' + esc(gt.email || 'Google account') : demo ? 'Connected (demo)' : 'Not connected';
+        const btn = real || demo ? 'Disconnect' : 'Connect';
+        return `<div class="list-item"><div><div class="t">${i.icon} ${i.name}</div><div class="s">${status}</div></div>
+        <button class="btn ${real || demo ? 'ghost' : ''} small" data-act="int-connect" data-v="${i.id}">${btn}</button></div>`;
+      }).join('')}</div>
+      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Slack and Notion are demo connections — real access would need their official OAuth.</div>`;
     },
   },
   workflows: {
@@ -1075,11 +1324,36 @@ Object.assign(MODULES, {
         <select class="field" name="gemini_model">${MODELS.map(m => `<option ${GEMINI_MODEL() === m ? 'selected' : ''}>${m}</option>`).join('')}</select>
         <label class="lbl">Voice language</label>
         <select class="field" name="voice_lang"><option value="bn-BD" ${state.voiceLang === 'bn-BD' ? 'selected' : ''}>Bengali (bn-BD)</option><option value="en-US" ${state.voiceLang === 'en-US' ? 'selected' : ''}>English (en-US)</option></select>
+        <label class="lbl">Google OAuth client ID (Web application client)</label>
+        <input class="field" name="google_client_id" value="${esc(googleClientId() === GOOGLE_CLIENT_ID_DEFAULT ? '' : googleClientId())}" placeholder="…apps.googleusercontent.com">
+        <label class="lbl">Google client secret (optional, stays on this device)</label>
+        <input class="field" type="password" name="google_client_secret" value="${esc(store.get('google_client_secret', '') || '')}" placeholder="GOCSPX-…">
+        <div class="note">Create it in Google Cloud → Credentials → OAuth client ID → Web application, redirect URI https://razzakar133-cell.github.io/kira-clone/oauth.html. The client secret is normally injected at build time from the repo secret${googleBuiltInSecretActive() ? ' (built-in secret is active)' : ''}; the field above is only needed if this install was built without it. Without the ID + secret, Google sign-in shows "not configured".</div>
         <button class="btn" type="submit">Save settings</button></form></div>
+      <div class="card"><h3>Google account</h3>
+        ${isGoogleSignedIn() ? `<div class="list-item"><div><div class="t">👤 ${esc((googleTokens().name || 'Google account'))}</div><div class="s">${esc(googleTokens().email || '')} · read-only scopes</div></div>
+        <button class="btn ghost small" data-act="google-signout">Sign out</button></div>`
+        : `<div class="s">Not signed in.</div><div class="btnrow" style="margin-top:8px"><button class="btn small" data-act="google-signin">Sign in with Google</button></div>`}
+      </div>
       <div class="card"><h3>Data</h3><div class="btnrow">
         <button class="btn ghost" data-act="cloud-export">⬇️ Export backup</button>
         <button class="btn danger" data-act="clear-all">🗑️ Clear all data</button></div></div>
       <div class="note">Kira clone v1.0 · Models: ${MODELS.join(', ')} · No passwords or OTPs are ever handled by this app.</div>`;
+    },
+  },
+  'google-signin': {
+    id: 'google-signin', icon: '🔍', title: 'Sign in with Google', hint: 'Paste the code from the Google redirect page.',
+    render() {
+      const url = state.googleManualUrl || '';
+      return `<div class="card"><p class="s">Sign in with Google in the browser that just opened:</p>
+      <label class="lbl">1. The Google sign-in link</label>
+      <div class="field" style="word-break:break-all;white-space:normal">${esc(url)}</div>
+      <div class="btnrow"><button class="btn small" data-act="copy-link" data-v="${esc(url)}">Copy link</button></div>
+      <p class="s">2. After signing in, Google opens a page that shows your authorization code. Copy the code from that page and paste it below.</p>
+      <form id="f-google-code"><label class="lbl">3. Paste the authorization code</label>
+      <input class="field" name="code" placeholder="4/0A…" required>
+      <button class="btn" type="submit">Complete sign-in</button></form></div>
+      <div class="note">Your Google account is used read-only (Gmail, Drive, Calendar). Tokens stay on this device.</div>`;
     },
   },
   notifications: {
@@ -1163,8 +1437,19 @@ const FORMS = {
     const k = (f.get('gemini_key') || '').trim();
     store.set('gemini_key', k);
     store.set('gemini_model', f.get('gemini_model') || MODELS[0]);
+    store.set('google_client_id', (f.get('google_client_id') || '').trim());
+    store.set('google_client_secret', (f.get('google_client_secret') || '').trim());
     state.voiceLang = f.get('voice_lang') || 'bn-BD'; store.set('voice_lang', state.voiceLang);
     toast('Settings saved.'); render();
+  },
+  'f-google-code'(f) {
+    const code = (f.get('code') || '').trim();
+    if (!code) return;
+    exchangeGoogleCode(code).then(() => {
+      const t = googleTokens();
+      toast('Signed in with Google' + (t && t.email ? ' as ' + t.email : '') + '.');
+      closeModule();
+    }).catch(() => toast('That code did not work — try signing in again.'));
   },
   'f-cal-add'(f) { const evs = store.get('events', []); evs.push({ id: uid(), title: f.get('title').trim(), date: f.get('date'), time: f.get('time') || '' }); store.set('events', evs); render(); },
   'f-rem-add'(f) { const r = store.get('reminders', []); r.push({ id: uid(), text: f.get('text').trim(), time: f.get('time') || '' }); store.set('reminders', r); render(); },
@@ -1360,7 +1645,18 @@ const ACTS = {
   'web-open'(el) { state.browserUrl = el.dataset.v; render(); },
   'email-send-note'() { toast('Real sending needs Gmail connected in Integrations. Draft is saved locally.'); },
   'msg-connect'(el) { const c = store.get('msg_conn', {}); const p = el.dataset.v; if (c[p]) delete c[p]; else c[p] = 'demo'; store.set('msg_conn', c); render(); },
-  'int-connect'(el) { const c = store.get('integrations', {}); const id = el.dataset.v; if (c[id]) delete c[id]; else c[id] = 'demo'; store.set('integrations', c); render(); },
+  'int-connect'(el) {
+    const id = el.dataset.v;
+    if (GOOGLE_IDS.includes(id)) {
+      const con = store.get('integrations', {});
+      if (con[id] === 'google' && isGoogleSignedIn()) { googleSignOut(); return; }
+      startGoogleSignIn();
+      return;
+    }
+    const c = store.get('integrations', {}); if (c[id]) delete c[id]; else c[id] = 'demo'; store.set('integrations', c); render();
+  },
+  'google-signin'() { startGoogleSignIn(); },
+  'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
   'social-resume'() { const cur = store.get('social_agent', 'paused'); store.set('social_agent', cur === 'paused' ? 'running' : 'paused'); toast(cur === 'paused' ? 'Agent resumed (demo).' : 'Agent paused.'); render(); },
   'social-connect'(el) { const c = store.get('social_conn', {}); const id = el.dataset.v; if (c[id]) delete c[id]; else c[id] = 'demo'; store.set('social_conn', c); render(); },
