@@ -45,7 +45,7 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
 
       - name: Build web app
-        run: npm run build
+        run: npm run build:single
 
       - name: Prepare Electron app
         shell: bash
