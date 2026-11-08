@@ -1,0 +1,66 @@
+name: Build Kira Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Inject Google client secret
+        shell: bash
+        run: |
+          if [ -z "$GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::GOOGLE_CLIENT_SECRET repo secret is not set. Add it in repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          grep -q "const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';" src/main.js || { echo "::error::Placeholder assignment not found in src/main.js"; exit 1; }
+          python3 - <<'PY'
+          import os
+          p = 'src/main.js'
+          s = open(p, encoding='utf-8').read()
+          s = s.replace(
+              "const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';",
+              "const GOOGLE_CLIENT_SECRET_DEFAULT = '" + os.environ['GOOGLE_CLIENT_SECRET'] + "';", 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('Google client secret injected.')
+          PY
+        env:
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Prepare Electron app
+        shell: bash
+        run: cp -r dist electron/dist
+
+      - name: Build Windows installer
+        run: |
+          cd electron
+          npm install
+          npx electron-builder
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kira-Windows
+          path: electron/dist/*.exe
+          if-no-files-found: error
+          retention-days: 7
