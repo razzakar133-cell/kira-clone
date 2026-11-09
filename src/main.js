@@ -92,19 +92,26 @@ function templateReply(text) {
    Until the client ID + secret are set, Connect shows "not configured yet"
    and nothing is sent anywhere. Tokens are stored on this device only
    (kira_google_tokens). Scopes are read-only: openid, email, profile,
-   gmail.readonly, drive.readonly, calendar.readonly. */
+   gmail.readonly, drive.readonly, calendar.readonly, youtube.readonly. */
 const GOOGLE_CLIENT_ID_DEFAULT = '419209461444-5sil155htgnd107qov73vssa7g4gajtb.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';
 const GOOGLE_REDIRECT_URI = 'https://razzakar133-cell.github.io/kira-clone/oauth.html';
 const GOOGLE_SCOPES = ['openid', 'email', 'profile',
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/drive.readonly',
-  'https://www.googleapis.com/auth/calendar.readonly'];
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/youtube.readonly'];
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 const GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo';
 const GOOGLE_IDS = ['google', 'gmail', 'drive', 'gcal'];
+/* YouTube Data API v3 (read-only, free quota) — uses the same Google OAuth
+   tokens as Gmail/Drive/Calendar (scope youtube.readonly, added above).
+   Pattern for the next provider: each provider needs its own OAuth client
+   ID + secret and a repo-secret injection step like GOOGLE_CLIENT_SECRET
+   (e.g. GitHub OAuth will need its own client ID/secret + workflow step). */
+const YOUTUBE_API = 'https://www.googleapis.com/youtube/v3';
 const googleClientId = () => { const v = (store.get('google_client_id', '') || '').trim(); return v || GOOGLE_CLIENT_ID_DEFAULT; };
 /* Secret resolution: built-in value injected at build time wins; otherwise the
    secret saved in Settings (device only); otherwise unconfigured. The built-in
@@ -320,6 +327,7 @@ const state = {
   googleManualUrl: '', // Google auth URL shown in the sign-in module (copy link + paste code)
   connSearch: '', // Connectors directory search text (kept across re-renders)
   connKeyFor: null, // id of the key connector whose inline API-key form is open
+  youtube: { status: 'idle' }, // YouTube channel cache: idle|loading|ready|need-scope|no-channel|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -383,7 +391,7 @@ const CONNECTORS = [
   { id: 'facebook-messenger', name: 'Facebook Messenger', icon: '💬', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.messenger.com' },
   { id: 'instagram', name: 'Instagram', icon: '📸', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.instagram.com' },
   { id: 'whatsapp', name: 'WhatsApp', icon: '📱', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://web.whatsapp.com' },
-  { id: 'youtube', name: 'YouTube', icon: '▶️', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.youtube.com' },
+  { id: 'youtube', name: 'YouTube', icon: '▶️', cat: CONNECTOR_CATS[0], kind: 'google', url: 'https://www.youtube.com' },
   { id: 'tiktok', name: 'TikTok', icon: '🎵', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.tiktok.com' },
   { id: 'linkedin', name: 'LinkedIn', icon: '💼', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.linkedin.com' },
   { id: 'x-twitter', name: 'X (Twitter)', icon: '✖️', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://x.com' },
@@ -521,9 +529,13 @@ function connCard(c, con) {
   const hay = (c.name + ' ' + c.cat + ' ' + c.id).toLowerCase();
   let btn = '', extra = '';
   if (c.kind === 'google') {
-    btn = isGoogleSignedIn()
-      ? `<button class="btn ghost small" data-act="conn-google" data-v="${c.id}">Disconnect</button>`
-      : `<button class="btn small" data-act="conn-google" data-v="${c.id}">Connect</button>`;
+    // YouTube is special: when signed in, the card opens the channel view
+    // instead of disconnecting (disconnect stays on the other Google cards).
+    btn = (c.id === 'youtube' && isGoogleSignedIn())
+      ? `<button class="btn small" data-act="conn-google" data-v="${c.id}">Open channel</button>`
+      : isGoogleSignedIn()
+        ? `<button class="btn ghost small" data-act="conn-google" data-v="${c.id}">Disconnect</button>`
+        : `<button class="btn small" data-act="conn-google" data-v="${c.id}">Connect</button>`;
   } else if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
     btn = k
@@ -560,12 +572,62 @@ function filterConnectorRows() {
   if (count) count.textContent = visible + ' of 100 connectors';
 }
 
+/* ---------- YouTube (read-only, free Data API quota) ---------- */
+function ytNum(n) { const v = Number(n || 0); return v.toLocaleString('en-US'); }
+function fmtYtDate(s) {
+  try { return new Date(s).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch { return s || ''; }
+}
+/* Load the signed-in user's YouTube channel + latest 5 videos into
+   state.youtube. Runs from afterRender when the youtube module is open.
+   403 = the stored Google tokens were granted before the youtube.readonly
+   scope was added (re-consent needed); 401 = token rejected, force one
+   refresh and retry once. Never shows raw API errors to the user. */
+async function loadYouTube() {
+  if (!isGoogleSignedIn()) return;
+  if (state.youtube.status === 'loading') return;
+  state.youtube = { status: 'loading' };
+  const show = () => { if (state.module === 'youtube') render(); };
+  let token = await refreshGoogleToken();
+  if (!token) { state.youtube = { status: 'need-scope' }; show(); return; }
+  const headers = () => ({ Authorization: 'Bearer ' + token });
+  try {
+    let res = await fetch(YOUTUBE_API + '/channels?part=snippet,statistics,contentDetails&mine=true', { headers: headers() });
+    if (res.status === 401) {
+      // Access token rejected — drop the cached token so refreshGoogleToken
+      // does a real refresh, then retry once.
+      const t = googleTokens();
+      store.set('google_tokens', { ...t, access_token: '', expires_at: 0 });
+      token = await refreshGoogleToken();
+      if (!token) { state.youtube = { status: 'need-scope' }; show(); return; }
+      res = await fetch(YOUTUBE_API + '/channels?part=snippet,statistics,contentDetails&mine=true', { headers: headers() });
+    }
+    if (res.status === 403) { state.youtube = { status: 'need-scope' }; show(); return; }
+    if (!res.ok) throw new Error('channels-' + res.status);
+    const data = await res.json().catch(() => ({}));
+    const ch = (data.items || [])[0];
+    if (!ch) { state.youtube = { status: 'no-channel' }; show(); return; }
+    const uploads = ch.contentDetails && ch.contentDetails.relatedPlaylists && ch.contentDetails.relatedPlaylists.uploads;
+    let videos = [];
+    if (uploads) {
+      const vres = await fetch(YOUTUBE_API + '/playlistItems?part=snippet&maxResults=5&playlistId=' + encodeURIComponent(uploads), { headers: headers() });
+      if (vres.ok) { const vdata = await vres.json().catch(() => ({})); videos = (vdata.items || []).map(it => it.snippet).filter(Boolean); }
+    }
+    state.youtube = { status: 'ready', channel: ch, videos };
+    show();
+  } catch {
+    state.youtube = { status: 'error' };
+    show();
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
     pkceChallenge, makeVerifier, googleClientId, googleClientSecret, resolveGoogleSecret,
     isGoogleConfigured, isGoogleSignedIn, googleTokens, exchangeGoogleCode,
-    googleSignOut, refreshGoogleToken, buildGoogleAuthUrl, GOOGLE_REDIRECT_URI, GOOGLE_IDS };
+    googleSignOut, refreshGoogleToken, buildGoogleAuthUrl, GOOGLE_REDIRECT_URI, GOOGLE_IDS,
+    GOOGLE_SCOPES, YOUTUBE_API, loadYouTube };
 }
 
 /* ---------- shell & router ---------- */
@@ -630,6 +692,7 @@ function afterRender() {
   if (state.tab === 'home' && !state.module) drawBrain();
   if (state.tab === 'chats' && !state.module) { const m = $('#chatMsgs'); if (m) m.scrollTop = m.scrollHeight; }
   if (state.tab === 'voice' && !state.module) tickClock();
+  if (state.module === 'youtube' && isGoogleSignedIn() && (state.youtube || {}).status === 'idle') loadYouTube();
 }
 
 /* ---------- HOME ---------- */
@@ -979,6 +1042,7 @@ const MORE_ITEMS = [
   { id: 'image-gen', icon: '✨', title: 'Image Gen' },
   { id: 'social-media', icon: '🔗', title: 'Social Media' },
   { id: 'connectors', icon: '🔗', title: 'Connectors' },
+  { id: 'youtube', icon: '▶️', title: 'YouTube' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -1237,6 +1301,52 @@ const MODULES = {
         ${g.items.map(c => connCard(c, con)).join('')}
       </div>`).join('') || emptyNote('No connectors match your search.')}
       <div class="note">Google services use your real Google sign-in (read-only scopes). AI provider keys are saved only on this device and never shown in full. Other services open their official site in the browser.</div>`;
+    },
+  },
+  youtube: {
+    id: 'youtube', icon: '▶️', title: 'YouTube', hint: 'তোমার YouTube চ্যানেল — সাবস্ক্রাইবার, ভিডিও, ভিউ। Google সাইন-ইন দিয়েই চলে (read-only)।',
+    render() {
+      if (!isGoogleSignedIn()) {
+        return `<div class="card"><h3>Connect Google first</h3>
+          <p class="muted">YouTube দেখতে তোমার Google অ্যাকাউন্ট কানেক্ট করো। এতে YouTube পারমিশনও চাওয়া হবে।</p>
+          <div class="btnrow"><button class="btn" data-act="google-signin">Connect Google</button></div></div>`;
+      }
+      const yt = state.youtube || { status: 'idle' };
+      if (yt.status === 'ready' && yt.channel) {
+        const ch = yt.channel, sn = ch.snippet || {}, st = ch.statistics || {};
+        const thumb = (sn.thumbnails && (sn.thumbnails.medium || sn.thumbnails.default) || {}).url || '';
+        return `<div class="card"><div class="list-item" style="border:none;padding:0"><div style="display:flex;gap:10px;align-items:center">
+          ${thumb ? `<img src="${esc(thumb)}" alt="" style="width:56px;height:56px;border-radius:50%;object-fit:cover">` : '<span style="font-size:40px">▶️</span>'}
+          <div><div class="t" style="font-size:18px">${esc(sn.title || 'Your channel')}</div>
+          <div class="s">${ytNum(st.subscriberCount)} subscribers · ${ytNum(st.videoCount)} videos · ${ytNum(st.viewCount)} views</div></div></div>
+          <button class="btn ghost small" data-act="yt-refresh">↻ Refresh</button></div></div>
+        <div class="card"><h3>Latest videos</h3>
+          ${yt.videos && yt.videos.length ? yt.videos.map(v => {
+            const vid = (v.resourceId && v.resourceId.videoId) || '';
+            const vthumb = (v.thumbnails && (v.thumbnails.medium || v.thumbnails.default) || {}).url || '';
+            return `<div class="list-item"><div style="display:flex;gap:10px;align-items:center">
+              ${vthumb ? `<img src="${esc(vthumb)}" alt="" style="width:96px;height:54px;border-radius:8px;object-fit:cover">` : ''}
+              <div><div class="t">${esc(v.title || '')}</div><div class="s">${fmtYtDate(v.publishedAt)}</div></div></div>
+              <button class="btn small" data-act="yt-open" data-v="${esc(vid)}">Watch</button></div>`;
+          }).join('') : emptyNote('No videos found on this channel yet.')}
+        </div>`;
+      }
+      if (yt.status === 'need-scope') {
+        return `<div class="card"><h3>YouTube যোগ হয়নি</h3>
+          <p class="muted">YouTube যোগ হয়নি — Google আবার কানেক্ট করো, এবার YouTube পারমিশনসহ। তোমার আগের Google কানেকশনে YouTube পারমিশন ছিল না।</p>
+          <div class="btnrow"><button class="btn" data-act="google-signin">Google আবার কানেক্ট করো</button></div></div>`;
+      }
+      if (yt.status === 'no-channel') {
+        return `<div class="card"><h3>No YouTube channel yet</h3>
+          <p class="muted">এই Google অ্যাকাউন্টে কোনো YouTube চ্যানেল নেই। YouTube-এ গিয়ে একটা চ্যানেল বানিয়ে নাও, তারপর এখানে দেখতে পাবে।</p>
+          <div class="btnrow"><button class="btn" data-act="yt-open-site">Open YouTube</button></div></div>`;
+      }
+      if (yt.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">YouTube ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="yt-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      return `<div class="card"><p class="muted">YouTube চ্যানেল লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -1904,9 +2014,18 @@ const ACTS = {
   },
   'conn-google'(el) {
     // Google-kind connectors reuse the existing real Google OAuth flow.
+    // YouTube is special: when already signed in, open the channel view.
+    if (el.dataset.v === 'youtube' && isGoogleSignedIn()) { openModule('youtube'); return; }
     if (isGoogleSignedIn()) { googleSignOut(); return; }
     startGoogleSignIn();
   },
+  'yt-open'(el) {
+    const vid = (el.dataset.v || '').trim();
+    if (!vid) return;
+    openConnUrl('https://www.youtube.com/watch?v=' + vid);
+  },
+  'yt-open-site'() { openConnUrl('https://www.youtube.com'); },
+  'yt-refresh'() { state.youtube = { status: 'idle' }; render(); },
   'conn-open'(el) {
     const c = CONNECTORS.find(x => x.id === el.dataset.v);
     if (!c) return;
