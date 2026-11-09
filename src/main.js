@@ -412,6 +412,7 @@ const state = {
   github: { status: 'idle' }, // GitHub profile+repos cache: idle|loading|ready|need-signin|error
   analytics: { status: 'idle' }, // GA4 properties + report cache: idle|loading|ready|need-scope|no-properties|error
   searchconsole: { status: 'idle' }, // Search Console sites + rows cache: idle|loading|ready|need-scope|no-sites|error
+  notion: { status: 'idle' }, // Notion shared pages cache: idle|loading|ready|empty|not-configured|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -454,7 +455,9 @@ const SOCIALS = [
 /* ---------- Connectors directory (100 services, 10 categories) ----------
    kind: 'google' = real Google OAuth (reuses the existing sign-in flow);
    'oauth' = real OAuth via the Worker proxy (GitHub — see GITHUB_* above);
-   'key' = API key saved on this device only; 'link' = opens the official site.
+   'worker' = Worker-backed integration (Notion — the token lives in the
+   Worker, the app never sees it); 'key' = API key saved on this device
+   only; 'link' = opens the official site.
    Connection state lives in localStorage under kira_connectors_v1 as
    { [id]: 'google' | 'key' | 'opened' }. Google and OAuth entries read the
    live token state (kira_google_tokens / kira_github_tokens) instead of
@@ -542,7 +545,7 @@ const CONNECTORS = [
   { id: 'dropbox', name: 'Dropbox', icon: '📦', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.dropbox.com' },
   { id: 'onedrive', name: 'OneDrive', icon: '☁️', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://onedrive.live.com' },
   { id: 'box', name: 'Box', icon: '📁', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.box.com' },
-  { id: 'notion', name: 'Notion', icon: '📝', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.notion.so' },
+  { id: 'notion', name: 'Notion', icon: '📝', cat: CONNECTOR_CATS[6], kind: 'worker', url: 'https://www.notion.so' },
   { id: 'evernote', name: 'Evernote', icon: '🐘', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://evernote.com' },
   { id: 'obsidian', name: 'Obsidian', icon: '💎', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://obsidian.md' },
   { id: 'adobe-acrobat', name: 'Adobe Acrobat', icon: '📕', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.adobe.com/acrobat.html' },
@@ -607,6 +610,10 @@ function connStatus(c, con) {
     }
     return 'Not connected';
   }
+  if (c.kind === 'worker' && c.id === 'notion') {
+    // Connected once the Notion module has loaded successfully at least once.
+    return store.get('notion_ok', '') === '1' ? 'Connected' : 'Open';
+  }
   if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
     return k ? 'Connected · key ' + maskKey(k) : 'Not connected · needs API key';
@@ -637,6 +644,10 @@ function connCard(c, con) {
     btn = isGitHubSignedIn()
       ? `<button class="btn small" data-act="conn-oauth" data-v="${c.id}">Open</button><button class="btn ghost small" data-act="conn-oauth-disconnect" data-v="${c.id}">Disconnect</button>`
       : `<button class="btn small" data-act="conn-oauth" data-v="${c.id}">Connect</button>`;
+  } else if (c.kind === 'worker') {
+    // Worker-backed integrations (Notion): Open shows the in-app module;
+    // auth lives in the Worker, so there is no sign-in step here.
+    btn = `<button class="btn small" data-act="conn-worker" data-v="${c.id}">Open</button>`;
   } else if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
     btn = k
@@ -901,6 +912,96 @@ async function loadSearchConsoleRows(siteUrl) {
   }
 }
 
+/* ---------- Notion (free integration, via the Worker proxy) ----------
+   The Notion integration token lives in the Worker as a secret env var;
+   the app NEVER contains or sends the token. Every Notion call goes
+   through the same Worker proxy as GitHub, with { provider: 'notion',
+   path, method, body }; the Worker adds the Authorization header
+   server-side and returns the Notion API JSON (or { error } on failure).
+   IMPORTANT: a Notion integration only sees pages/databases explicitly
+   shared with it (Notion → Share → 'Kira Clone'). Unshared pages never
+   appear, so the module explains that in Bengali when the list is empty. */
+async function notionCall(path, method = 'GET', body = null) {
+  const res = await fetch(OAUTH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'notion', path, method, body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || 'proxy_error');
+  return data;
+}
+/* Page title: pages keep it in properties.title.title[0].plain_text;
+   fall back to the first 8 chars of the page id when untitled.
+   Databases keep it in title[0].plain_text. */
+function notionTitle(r) {
+  if (!r) return '';
+  if (r.object === 'database') {
+    const t = (r.title || [])[0];
+    return (t && t.plain_text) || 'Untitled database';
+  }
+  const titleProp = r.properties && r.properties.title;
+  const first = titleProp && Array.isArray(titleProp.title) && titleProp.title[0];
+  return (first && first.plain_text) || String(r.id || '').slice(0, 8);
+}
+const NOTION_TEXT_BLOCKS = ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'to_do'];
+/* Plain text of one Notion block (rich_text joined), with a list marker
+   for bullets / numbers / to-dos. Returns '' for non-text blocks. */
+function notionBlockText(b) {
+  if (!b || !NOTION_TEXT_BLOCKS.includes(b.type)) return '';
+  const content = b[b.type] || {};
+  const rich = Array.isArray(content.rich_text) ? content.rich_text : [];
+  const text = rich.map(t => t.plain_text || '').join('');
+  if (!text) return '';
+  if (b.type === 'bulleted_list_item') return '• ' + text;
+  if (b.type === 'numbered_list_item') return '1. ' + text;
+  if (b.type === 'to_do') return (content.checked ? '☑ ' : '☐ ') + text;
+  return text;
+}
+function fmtNotionDate(s) {
+  try { return new Date(s).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch { return s || ''; }
+}
+/* Load the pages + databases shared with the integration into
+   state.notion. Runs from afterRender when the notion module is open.
+   Sets kira_notion_ok = '1' on the first successful search so the
+   connector card can show Connected. 'not-configured' = the Worker has
+   no Notion token yet. Never shows raw API errors to the user. */
+async function loadNotion() {
+  if (state.notion.status === 'loading') return;
+  state.notion = { status: 'loading' };
+  const show = () => { if (state.module === 'notion') render(); };
+  try {
+    const data = await notionCall('/search', 'POST', { page_size: 10 });
+    const results = Array.isArray(data.results) ? data.results : [];
+    store.set('notion_ok', '1');
+    if (!results.length) { state.notion = { status: 'empty' }; show(); return; }
+    state.notion = { status: 'ready', results, selected: null, blocks: null, blocksStatus: 'idle' };
+    show();
+  } catch (e) {
+    if (e && e.message === 'not_configured') state.notion = { status: 'not-configured' };
+    else state.notion = { status: 'error' };
+    show();
+  }
+}
+/* Load one page's text blocks into state.notion.blocks. */
+async function loadNotionPage(pageId) {
+  const cur = state.notion || {};
+  if (cur.blocksStatus === 'loading') return;
+  state.notion = { ...cur, selected: pageId, blocks: null, blocksStatus: 'loading' };
+  const show = () => { if (state.module === 'notion') render(); };
+  show();
+  try {
+    const data = await notionCall('/blocks/' + pageId + '/children', 'GET');
+    const blocks = Array.isArray(data.results) ? data.results : [];
+    state.notion = { ...state.notion, blocks, blocksStatus: 'ready' };
+    show();
+  } catch {
+    state.notion = { ...state.notion, blocksStatus: 'error' };
+    show();
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
@@ -912,7 +1013,8 @@ if (typeof window !== 'undefined') {
     loadSearchConsole, loadSearchConsoleRows,
     GITHUB_CLIENT_ID_DEFAULT, GITHUB_REDIRECT_URI, GITHUB_SCOPES, GITHUB_AUTH_URL,
     OAUTH_PROXY_URL, GITHUB_API, buildGitHubAuthUrl, startGitHubSignIn,
-    exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub };
+    exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub,
+    notionCall, loadNotion, loadNotionPage, notionTitle, notionBlockText };
 }
 
 /* ---------- shell & router ---------- */
@@ -981,6 +1083,7 @@ function afterRender() {
   if (state.module === 'github' && isGitHubSignedIn() && (state.github || {}).status === 'idle') loadGitHub();
   if (state.module === 'analytics' && isGoogleSignedIn() && (state.analytics || {}).status === 'idle') loadAnalytics();
   if (state.module === 'searchconsole' && isGoogleSignedIn() && (state.searchconsole || {}).status === 'idle') loadSearchConsole();
+  if (state.module === 'notion' && (state.notion || {}).status === 'idle') loadNotion();
 }
 
 /* ---------- HOME ---------- */
@@ -1334,6 +1437,7 @@ const MORE_ITEMS = [
   { id: 'github', icon: '🐙', title: 'GitHub' },
   { id: 'analytics', icon: '📊', title: 'Analytics' },
   { id: 'searchconsole', icon: '🔍', title: 'Search Console' },
+  { id: 'notion', icon: '📝', title: 'Notion' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -1526,7 +1630,7 @@ const MODULES = {
     },
   },
   integrations: {
-    id: 'integrations', icon: '🔌', title: 'Integrations', hint: 'Google sign-in is real — Slack and Notion are demo.',
+    id: 'integrations', icon: '🔌', title: 'Integrations', hint: 'Google, GitHub, YouTube, Analytics, Search Console and Notion are real — Slack is still demo.',
     render() {
       const con = store.get('integrations', {});
       const gt = googleTokens();
@@ -1543,7 +1647,7 @@ const MODULES = {
         return `<div class="list-item"><div><div class="t">${i.icon} ${i.name}</div><div class="s">${status}</div></div>
         <button class="btn ${real || demo ? 'ghost' : ''} small" data-act="int-connect" data-v="${i.id}">${btn}</button></div>`;
       }).join('')}</div>
-      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Slack and Notion are demo connections — real access would need their official OAuth. Jewel opens your personal agent chat (muse.ai) — the app that solves the problems this app cannot.</div>`;
+      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Notion is real now — see More → Connectors → Notion (pages shared with the Kira Clone integration appear there). Slack is still a demo connection — real access would need its official OAuth. Jewel opens your personal agent chat (muse.ai) — the app that solves the problems this app cannot.</div>`;
     },
   },
   workflows: {
@@ -1591,7 +1695,7 @@ const MODULES = {
       ${cats.map(g => `<div class="card" data-conn-cat="${esc(g.cat)}"><h3>${esc(g.cat)} (${g.items.length})</h3>
         ${g.items.map(c => connCard(c, con)).join('')}
       </div>`).join('') || emptyNote('No connectors match your search.')}
-      <div class="note">Google services use your real Google sign-in (read-only scopes). AI provider keys are saved only on this device and never shown in full. Other services open their official site in the browser.</div>`;
+      <div class="note">Google services use your real Google sign-in (read-only scopes). AI provider keys are saved only on this device and never shown in full. Notion opens in the app through the Worker — its token stays server-side, never on this device. Other services open their official site in the browser.</div>`;
     },
   },
   youtube: {
@@ -1772,6 +1876,48 @@ const MODULES = {
         ${rowsCard}`;
       }
       return `<div class="card"><p class="muted">Search Console লোড হচ্ছে…</p></div>`;
+    },
+  },
+  notion: {
+    id: 'notion', icon: '📝', title: 'Notion', hint: 'তোমার শেয়ার করা Notion পেজ আর ডাটাবেস — ফ্রি ইন্টিগ্রেশন। শুধু যে পেজগুলো Notion-এ শেয়ার করেছো সেগুলোই দেখা যাবে।',
+    render() {
+      const nt = state.notion || { status: 'idle' };
+      if (nt.status === 'not-configured') {
+        return `<div class="card"><h3>Notion এখনো সেটআপ হয়নি</h3>
+          <p class="muted">Notion এখনো সেটআপ হয়নি — একটু পরে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="notion-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (nt.status === 'empty') {
+        return `<div class="card"><h3>কোনো পেজ দেখা যাচ্ছে না</h3>
+          <p class="muted">Notion-এ কোনো পেজ দেখা যাচ্ছে না — Notion-এ গিয়ে পেজের Share → 'Kira Clone' ইন্টিগ্রেশন যোগ করো, তারপর এখানে Refresh চাপো।</p>
+          <div class="btnrow"><button class="btn" data-act="notion-refresh">↻ Refresh</button><button class="btn ghost" data-act="notion-open-site">Open Notion</button></div></div>`;
+      }
+      if (nt.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Notion ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="notion-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (nt.status === 'ready' && nt.results) {
+        const blocksCard = nt.selected
+          ? nt.blocksStatus === 'loading'
+            ? `<div class="card"><p class="muted">পেজ লোড হচ্ছে…</p></div>`
+            : nt.blocksStatus === 'ready'
+              ? `<div class="card"><div class="btnrow"><button class="btn ghost small" data-act="notion-back">← Back to list</button></div>
+                  ${(nt.blocks || []).map(b => notionBlockText(b)).filter(t => t).map(t => `<p style="margin:6px 0">${esc(t)}</p>`).join('') || emptyNote('এই পেজে কোনো লেখা নেই।')}</div>`
+              : `<div class="card"><p class="muted">পেজের লেখা আনা যায়নি — আবার চেষ্টা করো।</p><div class="btnrow"><button class="btn ghost small" data-act="notion-back">← Back</button></div></div>`
+          : '';
+        return `<div class="card"><h3>Shared pages &amp; databases</h3>
+          ${nt.results.map(r => {
+            const isDb = r.object === 'database';
+            return `<div class="list-item"><div><div class="t">${esc(notionTitle(r))}</div><div class="s">${isDb ? 'Database' : 'Page'} · ${esc(fmtNotionDate(r.last_edited_time))}</div></div>
+            <div style="display:flex;gap:6px">${isDb
+              ? `<button class="btn small" data-act="notion-open" data-v="${esc(r.url || '')}">Open in Notion</button>`
+              : `<button class="btn small" data-act="notion-page" data-v="${esc(r.id || '')}">${nt.selected === r.id ? '✓ দেখছো' : 'Open'}</button><button class="btn ghost small" data-act="notion-open" data-v="${esc(r.url || '')}">Open in Notion</button>`}</div></div>`;
+          }).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="notion-refresh">↻ Refresh</button></div></div>
+        ${blocksCard}`;
+      }
+      return `<div class="card"><p class="muted">Notion লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -2525,6 +2671,25 @@ const ACTS = {
   },
   'gh-refresh'() { state.github = { status: 'idle' }; render(); },
   'github-signin'() { startGitHubSignIn(); },
+  'conn-worker'(el) {
+    // Worker-backed connectors (Notion): Open shows the in-app module.
+    if (el.dataset.v === 'notion') openModule('notion');
+  },
+  'notion-refresh'() { state.notion = { status: 'idle' }; render(); },
+  'notion-open-site'() { openConnUrl('https://www.notion.so'); },
+  'notion-open'(el) {
+    const u = (el.dataset.v || '').trim();
+    if (u) openConnUrl(u);
+  },
+  'notion-page'(el) {
+    const id = (el.dataset.v || '').trim();
+    if (!id) return;
+    loadNotionPage(id);
+  },
+  'notion-back'() {
+    state.notion = { ...state.notion, selected: null, blocks: null, blocksStatus: 'idle' };
+    render();
+  },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
