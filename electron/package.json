@@ -1,1 +1,33 @@
-{"build":{"appId":"com.kira.clone","directories":{"output":"release"},"files":["main.js","dist/**/*"],"nsis":{"allowToChangeInstallationDirectory":true,"oneClick":false},"productName":"Kira Clone","publish":null,"win":{"target":"nsis"}},"description":"Kira Clone — all-in-one AI assistant for Windows","devDependencies":{"electron":"^31.0.0","electron-builder":"^24.13.3"},"main":"main.js","name":"kira-clone-desktop","scripts":{"dist":"electron-builder","start":"electron ."},"version":"1.0.2"}
+{
+  "build": {
+    "appId": "com.kira.clone",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "dist/**/*"
+    ],
+    "nsis": {
+      "allowToChangeInstallationDirectory": true,
+      "oneClick": false
+    },
+    "productName": "Kira Clone",
+    "publish": null,
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "description": "Kira Clone — all-in-one AI assistant for Windows",
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "main": "main.js",
+  "name": "kira-clone-desktop",
+  "scripts": {
+    "dist": "electron-builder",
+    "start": "electron ."
+  },
+  "version": "1.0.3"
+}
