@@ -59,9 +59,10 @@ jobs:
 
       - name: Verify packaged app
         run: |
-          if (!(Test-Path "electron/release/win-unpacked/resources/app/dist/index.html")) { throw "dist/index.html missing from packaged app" }
-          if (!(Test-Path "electron/release/win-unpacked/resources/app/main.js")) { throw "main.js missing from packaged app" }
-          (Get-Item "electron/release/win-unpacked/resources/app/dist/index.html").Length
+          npx asar list electron/release/win-unpacked/resources/app.asar
+          $files = npx asar list electron/release/win-unpacked/resources/app.asar
+          if ($files -notmatch "dist/index.html") { throw "dist/index.html missing from app.asar" }
+          if ($files -notmatch "main.js") { throw "main.js missing from app.asar" }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
