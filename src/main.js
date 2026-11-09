@@ -318,6 +318,8 @@ const state = {
   voiceLang: store.get('voice_lang', 'bn-BD'),
   pinned: store.get('pinned', ['messages', 'smart-calendar', 'meal-planner']),
   googleManualUrl: '', // Google auth URL shown in the sign-in module (copy link + paste code)
+  connSearch: '', // Connectors directory search text (kept across re-renders)
+  connKeyFor: null, // id of the key connector whose inline API-key form is open
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -357,8 +359,210 @@ const SOCIALS = [
   { id: 'x', name: 'X', cls: 'background:#eceff1;color:#141a33' },
 ];
 
+/* ---------- Connectors directory (100 services, 10 categories) ----------
+   kind: 'google' = real Google OAuth (reuses the existing sign-in flow);
+   'key' = API key saved on this device only; 'link' = opens the official site.
+   Connection state lives in localStorage under kira_connectors_v1 as
+   { [id]: 'google' | 'key' | 'opened' }. Google entries read the live
+   token state (kira_google_tokens) instead of that store. */
+const CONNECTOR_CATS = [
+  'Social Media ও Facebook Management',
+  'AI ও Automation',
+  'Office ও Productivity',
+  'Design ও Video Editing',
+  'Freelancing ও Online Business',
+  'Communication ও Meeting',
+  'File, Storage ও Document',
+  'Website ও Development',
+  'Marketing ও Analytics',
+  'Payment ও Daily Utilities',
+];
+const CONNECTORS = [
+  // 1. Social Media ও Facebook Management
+  { id: 'facebook', name: 'Facebook', icon: '📘', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.facebook.com' },
+  { id: 'facebook-messenger', name: 'Facebook Messenger', icon: '💬', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.messenger.com' },
+  { id: 'instagram', name: 'Instagram', icon: '📸', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.instagram.com' },
+  { id: 'whatsapp', name: 'WhatsApp', icon: '📱', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://web.whatsapp.com' },
+  { id: 'youtube', name: 'YouTube', icon: '▶️', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.youtube.com' },
+  { id: 'tiktok', name: 'TikTok', icon: '🎵', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.tiktok.com' },
+  { id: 'linkedin', name: 'LinkedIn', icon: '💼', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.linkedin.com' },
+  { id: 'x-twitter', name: 'X (Twitter)', icon: '✖️', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://x.com' },
+  { id: 'pinterest', name: 'Pinterest', icon: '📌', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.pinterest.com' },
+  { id: 'reddit', name: 'Reddit', icon: '🤖', cat: CONNECTOR_CATS[0], kind: 'link', url: 'https://www.reddit.com' },
+  // 2. AI ও Automation
+  { id: 'chatgpt', name: 'ChatGPT', icon: '🤖', cat: CONNECTOR_CATS[1], kind: 'key', url: 'https://chat.openai.com' },
+  { id: 'google-gemini', name: 'Google Gemini', icon: '✨', cat: CONNECTOR_CATS[1], kind: 'google', url: 'https://aistudio.google.com' },
+  { id: 'claude', name: 'Claude', icon: '🟠', cat: CONNECTOR_CATS[1], kind: 'key', url: 'https://claude.ai' },
+  { id: 'microsoft-copilot', name: 'Microsoft Copilot', icon: '🪟', cat: CONNECTOR_CATS[1], kind: 'key', url: 'https://copilot.microsoft.com' },
+  { id: 'perplexity', name: 'Perplexity', icon: '🔍', cat: CONNECTOR_CATS[1], kind: 'key', url: 'https://www.perplexity.ai' },
+  { id: 'deepseek', name: 'DeepSeek', icon: '🐋', cat: CONNECTOR_CATS[1], kind: 'key', url: 'https://chat.deepseek.com' },
+  { id: 'grok', name: 'Grok', icon: '🚀', cat: CONNECTOR_CATS[1], kind: 'key', url: 'https://grok.com' },
+  { id: 'n8n', name: 'n8n', icon: '🔄', cat: CONNECTOR_CATS[1], kind: 'link', url: 'https://n8n.io' },
+  { id: 'zapier', name: 'Zapier', icon: '⚡', cat: CONNECTOR_CATS[1], kind: 'link', url: 'https://zapier.com' },
+  { id: 'make', name: 'Make', icon: '🛠️', cat: CONNECTOR_CATS[1], kind: 'link', url: 'https://www.make.com' },
+  // 3. Office ও Productivity
+  { id: 'google-drive', name: 'Google Drive', icon: '💾', cat: CONNECTOR_CATS[2], kind: 'google', url: 'https://drive.google.com' },
+  { id: 'google-docs', name: 'Google Docs', icon: '📄', cat: CONNECTOR_CATS[2], kind: 'google', url: 'https://docs.google.com' },
+  { id: 'google-sheets', name: 'Google Sheets', icon: '📊', cat: CONNECTOR_CATS[2], kind: 'google', url: 'https://sheets.google.com' },
+  { id: 'google-slides', name: 'Google Slides', icon: '📽️', cat: CONNECTOR_CATS[2], kind: 'google', url: 'https://slides.google.com' },
+  { id: 'google-calendar', name: 'Google Calendar', icon: '📅', cat: CONNECTOR_CATS[2], kind: 'google', url: 'https://calendar.google.com' },
+  { id: 'gmail', name: 'Gmail', icon: '✉️', cat: CONNECTOR_CATS[2], kind: 'google', url: 'https://mail.google.com' },
+  { id: 'microsoft-word', name: 'Microsoft Word', icon: '📝', cat: CONNECTOR_CATS[2], kind: 'link', url: 'https://www.office.com' },
+  { id: 'microsoft-excel', name: 'Microsoft Excel', icon: '📈', cat: CONNECTOR_CATS[2], kind: 'link', url: 'https://www.office.com' },
+  { id: 'microsoft-powerpoint', name: 'Microsoft PowerPoint', icon: '📊', cat: CONNECTOR_CATS[2], kind: 'link', url: 'https://www.office.com' },
+  { id: 'microsoft-outlook', name: 'Microsoft Outlook', icon: '📧', cat: CONNECTOR_CATS[2], kind: 'link', url: 'https://outlook.live.com' },
+  // 4. Design ও Video Editing
+  { id: 'canva', name: 'Canva', icon: '🎨', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.canva.com' },
+  { id: 'adobe-photoshop', name: 'Adobe Photoshop', icon: '🖼️', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.adobe.com/products/photoshop.html' },
+  { id: 'adobe-illustrator', name: 'Adobe Illustrator', icon: '✏️', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.adobe.com/products/illustrator.html' },
+  { id: 'adobe-premiere-pro', name: 'Adobe Premiere Pro', icon: '🎬', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.adobe.com/products/premierepro.html' },
+  { id: 'capcut', name: 'CapCut', icon: '✂️', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.capcut.com' },
+  { id: 'figma', name: 'Figma', icon: '🎛️', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.figma.com' },
+  { id: 'adobe-express', name: 'Adobe Express', icon: '✨', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://www.adobe.com/express/' },
+  { id: 'invideo', name: 'InVideo', icon: '🎥', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://invideo.io' },
+  { id: 'runway', name: 'Runway', icon: '🎞️', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://runwayml.com' },
+  { id: 'elevenlabs', name: 'ElevenLabs', icon: '🔊', cat: CONNECTOR_CATS[3], kind: 'link', url: 'https://elevenlabs.io' },
+  // 5. Freelancing ও Online Business
+  { id: 'fiverr', name: 'Fiverr', icon: '💚', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.fiverr.com' },
+  { id: 'upwork', name: 'Upwork', icon: '💼', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.upwork.com' },
+  { id: 'freelancer-com', name: 'Freelancer.com', icon: '👷', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.freelancer.com' },
+  { id: 'peopleperhour', name: 'PeoplePerHour', icon: '⏰', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.peopleperhour.com' },
+  { id: 'behance', name: 'Behance', icon: '🎨', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.behance.net' },
+  { id: 'dribbble', name: 'Dribbble', icon: '🏀', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://dribbble.com' },
+  { id: 'shopify', name: 'Shopify', icon: '🛍️', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.shopify.com' },
+  { id: 'woocommerce', name: 'WooCommerce', icon: '🛒', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://woocommerce.com' },
+  { id: 'etsy', name: 'Etsy', icon: '🧶', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://www.etsy.com' },
+  { id: 'amazon-seller-central', name: 'Amazon Seller Central', icon: '📦', cat: CONNECTOR_CATS[4], kind: 'link', url: 'https://sellercentral.amazon.com' },
+  // 6. Communication ও Meeting
+  { id: 'zoom', name: 'Zoom', icon: '📹', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://zoom.us' },
+  { id: 'google-meet', name: 'Google Meet', icon: '🎥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://meet.google.com' },
+  { id: 'microsoft-teams', name: 'Microsoft Teams', icon: '👥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://teams.microsoft.com' },
+  { id: 'slack', name: 'Slack', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://slack.com' },
+  { id: 'discord', name: 'Discord', icon: '🎮', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://discord.com' },
+  { id: 'telegram', name: 'Telegram', icon: '✈️', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://web.telegram.org' },
+  { id: 'skype', name: 'Skype', icon: '📞', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.skype.com' },
+  { id: 'viber', name: 'Viber', icon: '📲', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.viber.com' },
+  { id: 'wechat', name: 'WeChat', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.wechat.com' },
+  { id: 'google-voice', name: 'Google Voice', icon: '☎️', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://voice.google.com' },
+  // 7. File, Storage ও Document
+  { id: 'dropbox', name: 'Dropbox', icon: '📦', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.dropbox.com' },
+  { id: 'onedrive', name: 'OneDrive', icon: '☁️', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://onedrive.live.com' },
+  { id: 'box', name: 'Box', icon: '📁', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.box.com' },
+  { id: 'notion', name: 'Notion', icon: '📝', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.notion.so' },
+  { id: 'evernote', name: 'Evernote', icon: '🐘', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://evernote.com' },
+  { id: 'obsidian', name: 'Obsidian', icon: '💎', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://obsidian.md' },
+  { id: 'adobe-acrobat', name: 'Adobe Acrobat', icon: '📕', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.adobe.com/acrobat.html' },
+  { id: 'docusign', name: 'DocuSign', icon: '✍️', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.docusign.com' },
+  { id: 'wetransfer', name: 'WeTransfer', icon: '📤', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://wetransfer.com' },
+  { id: 'google-keep', name: 'Google Keep', icon: '📌', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://keep.google.com' },
+  // 8. Website ও Development
+  { id: 'github', name: 'GitHub', icon: '🐙', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://github.com' },
+  { id: 'gitlab', name: 'GitLab', icon: '🦊', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://gitlab.com' },
+  { id: 'bitbucket', name: 'Bitbucket', icon: '🪣', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://bitbucket.org' },
+  { id: 'vercel', name: 'Vercel', icon: '▲', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://vercel.com' },
+  { id: 'netlify', name: 'Netlify', icon: '🌐', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://www.netlify.com' },
+  { id: 'wordpress', name: 'WordPress', icon: '📰', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://wordpress.com' },
+  { id: 'webflow', name: 'Webflow', icon: '🕸️', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://webflow.com' },
+  { id: 'wix', name: 'Wix', icon: '🧩', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://www.wix.com' },
+  { id: 'cloudflare', name: 'Cloudflare', icon: '☁️', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://www.cloudflare.com' },
+  { id: 'firebase', name: 'Firebase', icon: '🔥', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://firebase.google.com' },
+  // 9. Marketing ও Analytics
+  { id: 'google-analytics', name: 'Google Analytics', icon: '📈', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://analytics.google.com' },
+  { id: 'google-search-console', name: 'Google Search Console', icon: '🔎', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://search.google.com/search-console' },
+  { id: 'google-ads', name: 'Google Ads', icon: '📢', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://ads.google.com' },
+  { id: 'meta-ads-manager', name: 'Meta Ads Manager', icon: '📣', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://adsmanager.facebook.com' },
+  { id: 'meta-business-suite', name: 'Meta Business Suite', icon: '💼', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://business.facebook.com' },
+  { id: 'mailchimp', name: 'Mailchimp', icon: '🐵', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://mailchimp.com' },
+  { id: 'brevo', name: 'Brevo', icon: '✉️', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://www.brevo.com' },
+  { id: 'hubspot', name: 'HubSpot', icon: '🧲', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://www.hubspot.com' },
+  { id: 'buffer', name: 'Buffer', icon: '📬', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://buffer.com' },
+  { id: 'hootsuite', name: 'Hootsuite', icon: '🦉', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://www.hootsuite.com' },
+  // 10. Payment ও Daily Utilities
+  { id: 'paypal', name: 'PayPal', icon: '💳', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://www.paypal.com' },
+  { id: 'stripe', name: 'Stripe', icon: '💳', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://stripe.com' },
+  { id: 'wise', name: 'Wise', icon: '🌍', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://wise.com' },
+  { id: 'payoneer', name: 'Payoneer', icon: '💵', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://www.payoneer.com' },
+  { id: 'bkash', name: 'bKash', icon: '📱', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://www.bkash.com' },
+  { id: 'nagad', name: 'Nagad', icon: '📱', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://www.nagad.com.bd' },
+  { id: 'google-maps', name: 'Google Maps', icon: '🗺️', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://maps.google.com' },
+  { id: 'google-translate', name: 'Google Translate', icon: '🌐', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://translate.google.com' },
+  { id: 'google-news', name: 'Google News', icon: '📰', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://news.google.com' },
+  { id: 'weather-com', name: 'Weather.com', icon: '🌤️', cat: CONNECTOR_CATS[9], kind: 'link', url: 'https://weather.com' },
+];
+/* Connector state helpers. */
+function connState() { return store.get('connectors_v1', {}); }
+function connSetState(con) { store.set('connectors_v1', con); }
+/* Show only first 4 + last 4 chars of an API key — never the full key. */
+function maskKey(k) {
+  k = String(k || '');
+  if (k.length <= 8) return k.slice(0, 2) + '…' + k.slice(-2);
+  return k.slice(0, 4) + '…' + k.slice(-4);
+}
+function connStatus(c, con) {
+  if (c.kind === 'google') {
+    if (isGoogleSignedIn()) {
+      const t = googleTokens();
+      return 'Connected · ' + ((t && t.email) || 'Google account');
+    }
+    return 'Not connected';
+  }
+  if (c.kind === 'key') {
+    const k = store.get('key_' + c.id, '');
+    return k ? 'Connected · key ' + maskKey(k) : 'Not connected · needs API key';
+  }
+  return con[c.id] === 'opened' ? 'Opened' : 'Open in browser';
+}
+function openConnUrl(url) {
+  if (isNativeApp()) { try { Browser.open({ url }); } catch {} }
+  else { try { window.open(url, '_blank'); } catch {} }
+}
+function connCard(c, con) {
+  const st = connStatus(c, con);
+  const hay = (c.name + ' ' + c.cat + ' ' + c.id).toLowerCase();
+  let btn = '', extra = '';
+  if (c.kind === 'google') {
+    btn = isGoogleSignedIn()
+      ? `<button class="btn ghost small" data-act="conn-google" data-v="${c.id}">Disconnect</button>`
+      : `<button class="btn small" data-act="conn-google" data-v="${c.id}">Connect</button>`;
+  } else if (c.kind === 'key') {
+    const k = store.get('key_' + c.id, '');
+    btn = k
+      ? `<button class="btn ghost small" data-act="conn-key-del" data-v="${c.id}">Remove key</button>`
+      : `<button class="btn small" data-act="conn-key-open" data-v="${c.id}">Add key</button>`;
+    if (state.connKeyFor === c.id) {
+      extra = `<form id="f-conn-key" data-conn="${c.id}" data-conn-name="${esc(hay)}" style="margin-top:8px">
+        <label class="lbl">API key for ${esc(c.name)} — saved only on this device</label>
+        <input class="field" type="password" name="key" placeholder="Paste your ${esc(c.name)} API key" required>
+        <button class="btn small" type="submit">Save key</button></form>`;
+    }
+  } else {
+    btn = `<button class="btn small" data-act="conn-open" data-v="${c.id}">Open</button>`;
+  }
+  return `<div class="list-item" data-conn="${c.id}" data-conn-name="${esc(hay)}"><div><div class="t">${c.icon} ${esc(c.name)}</div><div class="s">${esc(st)}</div></div>
+    <div style="display:flex;gap:6px;align-items:center">${btn}</div></div>${extra}`;
+}
+/* Live search filter for the Connectors module — filters rows in place so the
+   search input never loses focus (a full re-render would drop the cursor). */
+function filterConnectorRows() {
+  const q = (state.connSearch || '').trim().toLowerCase();
+  let visible = 0;
+  document.querySelectorAll('[data-conn]').forEach(row => {
+    const hay = row.getAttribute('data-conn-name') || '';
+    const show = !q || hay.includes(q);
+    row.style.display = show ? '' : 'none';
+    if (show) visible++;
+  });
+  document.querySelectorAll('[data-conn-cat]').forEach(sec => {
+    const anyVisible = [...sec.querySelectorAll('[data-conn]')].some(r => r.style.display !== 'none');
+    sec.style.display = anyVisible ? '' : 'none';
+  });
+  const count = document.querySelector('#connCount');
+  if (count) count.textContent = visible + ' of 100 connectors';
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
+    CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
     pkceChallenge, makeVerifier, googleClientId, googleClientSecret, resolveGoogleSecret,
     isGoogleConfigured, isGoogleSignedIn, googleTokens, exchangeGoogleCode,
     googleSignOut, refreshGoogleToken, buildGoogleAuthUrl, GOOGLE_REDIRECT_URI, GOOGLE_IDS };
@@ -774,6 +978,7 @@ const MORE_ITEMS = [
   { id: 'business-card', icon: '🪪', title: 'AI Business Card' },
   { id: 'image-gen', icon: '✨', title: 'Image Gen' },
   { id: 'social-media', icon: '🔗', title: 'Social Media' },
+  { id: 'connectors', icon: '🔗', title: 'Connectors' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -1012,6 +1217,26 @@ const MODULES = {
       <div class="card"><h3>Leads (${leads.length})</h3>
         ${leads.length ? leads.map(l => `<div class="list-item"><div><div class="t">${esc(l.name)}</div><div class="s">${esc(l.email)}${l.interest ? ' · ' + esc(l.interest) : ''}</div></div>${delBtn('leads', l.id)}</div>`).join('') : emptyNote('No leads yet.')}
       </div>`;
+    },
+  },
+  connectors: {
+    id: 'connectors', icon: '🔗', title: 'Connectors', hint: '১০০টি সার্ভিস — Google সাইন-ইন, API key, বা সরাসরি খুলুন। চাবি আর টোকেন শুধু এই ডিভাইসেই থাকে।',
+    render() {
+      const q = (state.connSearch || '').trim().toLowerCase();
+      const list = q
+        ? CONNECTORS.filter(c => (c.name + ' ' + c.cat + ' ' + c.id).toLowerCase().includes(q))
+        : CONNECTORS;
+      const con = connState();
+      const cats = CONNECTOR_CATS.map(cat => ({ cat, items: list.filter(c => c.cat === cat) })).filter(g => g.items.length);
+      return `<div class="card">
+        <label class="lbl">Search connectors</label>
+        <input class="field" id="connSearch" data-act-input="conn-search" placeholder="Search — e.g. Facebook, Fiverr, Gemini…" value="${esc(state.connSearch || '')}">
+        <div class="s" id="connCount" style="margin-top:6px">${list.length} of 100 connectors</div>
+      </div>
+      ${cats.map(g => `<div class="card" data-conn-cat="${esc(g.cat)}"><h3>${esc(g.cat)} (${g.items.length})</h3>
+        ${g.items.map(c => connCard(c, con)).join('')}
+      </div>`).join('') || emptyNote('No connectors match your search.')}
+      <div class="note">Google services use your real Google sign-in (read-only scopes). AI provider keys are saved only on this device and never shown in full. Other services open their official site in the browser.</div>`;
     },
   },
 };
@@ -1438,6 +1663,16 @@ function fd(form) { return new FormData(form); }
 const FORMS = {
   'chatForm'(f) { sendChat(f.get('chatInput') || ''); },
   'keyForm'(f) { const k = (f.get('gemini_key') || '').trim(); if (k) { store.set('gemini_key', k); toast('Gemini key saved on this device.'); render(); } },
+  'f-conn-key'(f, form) {
+    const id = form && form.dataset ? form.dataset.conn : '';
+    const k = (f.get('key') || '').trim();
+    if (!id || !k) return;
+    store.set('key_' + id, k);
+    const con = connState(); con[id] = 'key'; connSetState(con);
+    state.connKeyFor = null;
+    toast('API key saved on this device.');
+    render();
+  },
   'f-settings'(f) {
     const k = (f.get('gemini_key') || '').trim();
     store.set('gemini_key', k);
@@ -1667,6 +1902,28 @@ const ACTS = {
     if (isNativeApp()) { Browser.open({ url: it.link }).catch(() => {}); }
     else { try { window.open(it.link, '_blank'); } catch {} }
   },
+  'conn-google'(el) {
+    // Google-kind connectors reuse the existing real Google OAuth flow.
+    if (isGoogleSignedIn()) { googleSignOut(); return; }
+    startGoogleSignIn();
+  },
+  'conn-open'(el) {
+    const c = CONNECTORS.find(x => x.id === el.dataset.v);
+    if (!c) return;
+    const con = connState(); con[c.id] = 'opened'; connSetState(con);
+    openConnUrl(c.url);
+    toast('Opened ' + c.name + '.');
+    render();
+  },
+  'conn-key-open'(el) { state.connKeyFor = el.dataset.v; render(); },
+  'conn-key-del'(el) {
+    const id = el.dataset.v;
+    store.del('key_' + id);
+    const con = connState(); delete con[id]; connSetState(con);
+    if (state.connKeyFor === id) state.connKeyFor = null;
+    toast('API key removed.');
+    render();
+  },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
@@ -1736,6 +1993,14 @@ const CHANGES = {
   },
 };
 
+/* ---------- input actions (live, no submit) ---------- */
+const INPUTS = {
+  'conn-search'(el) {
+    state.connSearch = el.value || '';
+    filterConnectorRows();
+  },
+};
+
 /* ---------- global listeners ---------- */
 document.addEventListener('click', (e) => {
   const nav = e.target.closest('[data-nav]');
@@ -1760,6 +2025,10 @@ document.addEventListener('submit', (e) => {
 document.addEventListener('change', (e) => {
   const el = e.target.closest('[data-act-change]');
   if (el && CHANGES[el.dataset.actChange]) CHANGES[el.dataset.actChange](el, e);
+});
+document.addEventListener('input', (e) => {
+  const el = e.target.closest('[data-act-input]');
+  if (el && INPUTS[el.dataset.actInput]) INPUTS[el.dataset.actInput](el, e);
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { state.sheet = null; state.drawer = false; render(); } });
 
