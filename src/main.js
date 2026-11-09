@@ -92,7 +92,8 @@ function templateReply(text) {
    Until the client ID + secret are set, Connect shows "not configured yet"
    and nothing is sent anywhere. Tokens are stored on this device only
    (kira_google_tokens). Scopes are read-only: openid, email, profile,
-   gmail.readonly, drive.readonly, calendar.readonly, youtube.readonly. */
+   gmail.readonly, drive.readonly, calendar.readonly, youtube.readonly,
+   analytics.readonly, webmasters.readonly. */
 const GOOGLE_CLIENT_ID_DEFAULT = '419209461444-5sil155htgnd107qov73vssa7g4gajtb.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET_DEFAULT = '__GOOGLE_CLIENT_SECRET__';
 const GOOGLE_REDIRECT_URI = 'https://razzakar133-cell.github.io/kira-clone/oauth.html';
@@ -100,7 +101,9 @@ const GOOGLE_SCOPES = ['openid', 'email', 'profile',
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/drive.readonly',
   'https://www.googleapis.com/auth/calendar.readonly',
-  'https://www.googleapis.com/auth/youtube.readonly'];
+  'https://www.googleapis.com/auth/youtube.readonly',
+  'https://www.googleapis.com/auth/analytics.readonly',
+  'https://www.googleapis.com/auth/webmasters.readonly'];
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
@@ -109,6 +112,13 @@ const GOOGLE_IDS = ['google', 'gmail', 'drive', 'gcal'];
 /* YouTube Data API v3 (read-only, free quota) — uses the same Google OAuth
    tokens as Gmail/Drive/Calendar (scope youtube.readonly, added above). */
 const YOUTUBE_API = 'https://www.googleapis.com/youtube/v3';
+/* Google Analytics (GA4) + Search Console (read-only, free) — same Google
+   OAuth tokens (scopes analytics.readonly + webmasters.readonly, added
+   above). Admin API lists GA4 properties, Data API runs reports, Search
+   Console API lists verified sites + searchAnalytics rows. */
+const GA_ADMIN_API = 'https://analyticsadmin.googleapis.com/v1alpha';
+const GA_DATA_API = 'https://analyticsdata.googleapis.com/v1beta';
+const GSC_API = 'https://searchconsole.googleapis.com/webmasters/v3';
 const googleClientId = () => { const v = (store.get('google_client_id', '') || '').trim(); return v || GOOGLE_CLIENT_ID_DEFAULT; };
 /* Secret resolution: built-in value injected at build time wins; otherwise the
    secret saved in Settings (device only); otherwise unconfigured. The built-in
@@ -400,6 +410,8 @@ const state = {
   connKeyFor: null, // id of the key connector whose inline API-key form is open
   youtube: { status: 'idle' }, // YouTube channel cache: idle|loading|ready|need-scope|no-channel|error
   github: { status: 'idle' }, // GitHub profile+repos cache: idle|loading|ready|need-signin|error
+  analytics: { status: 'idle' }, // GA4 properties + report cache: idle|loading|ready|need-scope|no-properties|error
+  searchconsole: { status: 'idle' }, // Search Console sites + rows cache: idle|loading|ready|need-scope|no-sites|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -549,8 +561,8 @@ const CONNECTORS = [
   { id: 'cloudflare', name: 'Cloudflare', icon: '☁️', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://www.cloudflare.com' },
   { id: 'firebase', name: 'Firebase', icon: '🔥', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://firebase.google.com' },
   // 9. Marketing ও Analytics
-  { id: 'google-analytics', name: 'Google Analytics', icon: '📈', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://analytics.google.com' },
-  { id: 'google-search-console', name: 'Google Search Console', icon: '🔎', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://search.google.com/search-console' },
+  { id: 'google-analytics', name: 'Google Analytics', icon: '📈', cat: CONNECTOR_CATS[8], kind: 'google', url: 'https://analytics.google.com' },
+  { id: 'google-search-console', name: 'Google Search Console', icon: '🔎', cat: CONNECTOR_CATS[8], kind: 'google', url: 'https://search.google.com/search-console' },
   { id: 'google-ads', name: 'Google Ads', icon: '📢', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://ads.google.com' },
   { id: 'meta-ads-manager', name: 'Meta Ads Manager', icon: '📣', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://adsmanager.facebook.com' },
   { id: 'meta-business-suite', name: 'Meta Business Suite', icon: '💼', cat: CONNECTOR_CATS[8], kind: 'link', url: 'https://business.facebook.com' },
@@ -610,10 +622,12 @@ function connCard(c, con) {
   const hay = (c.name + ' ' + c.cat + ' ' + c.id).toLowerCase();
   let btn = '', extra = '';
   if (c.kind === 'google') {
-    // YouTube is special: when signed in, the card opens the channel view
-    // instead of disconnecting (disconnect stays on the other Google cards).
-    btn = (c.id === 'youtube' && isGoogleSignedIn())
-      ? `<button class="btn small" data-act="conn-google" data-v="${c.id}">Open channel</button>`
+    // YouTube / Analytics / Search Console are special: when signed in, the
+    // card opens the data view instead of disconnecting (disconnect stays
+    // on the other Google cards).
+    const openLabel = { youtube: 'Open channel', 'google-analytics': 'Open', 'google-search-console': 'Open' }[c.id];
+    btn = (openLabel && isGoogleSignedIn())
+      ? `<button class="btn small" data-act="conn-google" data-v="${c.id}">${openLabel}</button>`
       : isGoogleSignedIn()
         ? `<button class="btn ghost small" data-act="conn-google" data-v="${c.id}">Disconnect</button>`
         : `<button class="btn small" data-act="conn-google" data-v="${c.id}">Connect</button>`;
@@ -747,6 +761,146 @@ async function loadGitHub() {
   }
 }
 
+/* ---------- Google Analytics + Search Console (read-only, free) ---------- */
+function gaNum(n) { const v = Number(n || 0); return v.toLocaleString('en-US'); }
+/* YYYY-MM-DD for a Date (local time) — used for Search Console ranges. */
+function scDateStr(d) {
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), day = String(d.getDate()).padStart(2, '0');
+  return y + '-' + m + '-' + day;
+}
+function daysAgoStr(n) { const d = new Date(); d.setDate(d.getDate() - n); return scDateStr(d); }
+/* Drop the cached access token so refreshGoogleToken() does a real refresh
+   (shared by the Analytics/Search Console loaders on a 401 retry). */
+async function gaRefreshOnce() {
+  const t = googleTokens();
+  store.set('google_tokens', { ...t, access_token: '', expires_at: 0 });
+  return refreshGoogleToken();
+}
+/* Load the user's GA4 properties into state.analytics. Runs from
+   afterRender when the analytics module is open. 403 = the stored Google
+   tokens were granted before the analytics.readonly scope was added
+   (re-consent needed); 401 = token rejected, force one refresh and retry
+   once. Never shows raw API errors to the user. */
+async function loadAnalytics() {
+  if (!isGoogleSignedIn()) return;
+  if (state.analytics.status === 'loading') return;
+  state.analytics = { status: 'loading' };
+  const show = () => { if (state.module === 'analytics') render(); };
+  let token = await refreshGoogleToken();
+  if (!token) { state.analytics = { status: 'need-scope' }; show(); return; }
+  const headers = () => ({ Authorization: 'Bearer ' + token });
+  try {
+    let res = await fetch(GA_ADMIN_API + '/properties?pageSize=10', { headers: headers() });
+    if (res.status === 401) {
+      token = await gaRefreshOnce();
+      if (!token) { state.analytics = { status: 'need-scope' }; show(); return; }
+      res = await fetch(GA_ADMIN_API + '/properties?pageSize=10', { headers: headers() });
+    }
+    if (res.status === 403) { state.analytics = { status: 'need-scope' }; show(); return; }
+    if (!res.ok) throw new Error('properties-' + res.status);
+    const data = await res.json().catch(() => ({}));
+    const properties = Array.isArray(data.properties) ? data.properties : [];
+    if (!properties.length) { state.analytics = { status: 'no-properties' }; show(); return; }
+    state.analytics = { status: 'ready', properties, selected: null, report: null, reportStatus: 'idle' };
+    show();
+  } catch {
+    state.analytics = { status: 'error' };
+    show();
+  }
+}
+/* Run the last-7-days report for one GA4 property (name like
+   'properties/123456789') into state.analytics.report. */
+async function loadAnalyticsReport(property) {
+  if (!isGoogleSignedIn() || !property) return;
+  const cur = state.analytics || {};
+  if (cur.reportStatus === 'loading') return;
+  state.analytics = { ...cur, selected: property, report: null, reportStatus: 'loading' };
+  const show = () => { if (state.module === 'analytics') render(); };
+  show();
+  let token = await refreshGoogleToken();
+  if (!token) { state.analytics = { ...state.analytics, reportStatus: 'error' }; show(); return; }
+  const headers = () => ({ Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' });
+  const body = JSON.stringify({ dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }], metrics: [{ name: 'sessions' }, { name: 'totalUsers' }, { name: 'screenPageViews' }] });
+  try {
+    let res = await fetch(GA_DATA_API + '/' + property + ':runReport', { method: 'POST', headers: headers(), body });
+    if (res.status === 401) {
+      token = await gaRefreshOnce();
+      if (!token) { state.analytics = { ...state.analytics, reportStatus: 'error' }; show(); return; }
+      res = await fetch(GA_DATA_API + '/' + property + ':runReport', { method: 'POST', headers: headers(), body });
+    }
+    if (res.status === 403) { state.analytics = { status: 'need-scope' }; show(); return; }
+    if (!res.ok) throw new Error('runReport-' + res.status);
+    const data = await res.json().catch(() => ({}));
+    state.analytics = { ...state.analytics, report: data, reportStatus: 'ready' };
+    show();
+  } catch {
+    state.analytics = { ...state.analytics, reportStatus: 'error' };
+    show();
+  }
+}
+/* Load the user's verified Search Console sites into state.searchconsole.
+   Runs from afterRender when the searchconsole module is open. 403 = the
+   stored Google tokens were granted before the webmasters.readonly scope
+   was added (re-consent needed); 401 = refresh once and retry. */
+async function loadSearchConsole() {
+  if (!isGoogleSignedIn()) return;
+  if (state.searchconsole.status === 'loading') return;
+  state.searchconsole = { status: 'loading' };
+  const show = () => { if (state.module === 'searchconsole') render(); };
+  let token = await refreshGoogleToken();
+  if (!token) { state.searchconsole = { status: 'need-scope' }; show(); return; }
+  const headers = () => ({ Authorization: 'Bearer ' + token });
+  try {
+    let res = await fetch(GSC_API + '/sites', { headers: headers() });
+    if (res.status === 401) {
+      token = await gaRefreshOnce();
+      if (!token) { state.searchconsole = { status: 'need-scope' }; show(); return; }
+      res = await fetch(GSC_API + '/sites', { headers: headers() });
+    }
+    if (res.status === 403) { state.searchconsole = { status: 'need-scope' }; show(); return; }
+    if (!res.ok) throw new Error('sites-' + res.status);
+    const data = await res.json().catch(() => ({}));
+    const sites = Array.isArray(data.siteEntry) ? data.siteEntry : [];
+    if (!sites.length) { state.searchconsole = { status: 'no-sites' }; show(); return; }
+    state.searchconsole = { status: 'ready', sites, selected: null, rows: null, rowsStatus: 'idle' };
+    show();
+  } catch {
+    state.searchconsole = { status: 'error' };
+    show();
+  }
+}
+/* Load the last 7 days of searchAnalytics rows for one site into
+   state.searchconsole.rows. Dates are computed in code, never hardcoded. */
+async function loadSearchConsoleRows(siteUrl) {
+  if (!isGoogleSignedIn() || !siteUrl) return;
+  const cur = state.searchconsole || {};
+  if (cur.rowsStatus === 'loading') return;
+  state.searchconsole = { ...cur, selected: siteUrl, rows: null, rowsStatus: 'loading' };
+  const show = () => { if (state.module === 'searchconsole') render(); };
+  show();
+  let token = await refreshGoogleToken();
+  if (!token) { state.searchconsole = { ...state.searchconsole, rowsStatus: 'error' }; show(); return; }
+  const headers = () => ({ Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' });
+  const body = JSON.stringify({ startDate: daysAgoStr(7), endDate: scDateStr(new Date()), dimensions: ['date'], rowLimit: 7 });
+  try {
+    let res = await fetch(GSC_API + '/sites/' + encodeURIComponent(siteUrl) + '/searchAnalytics', { method: 'POST', headers: headers(), body });
+    if (res.status === 401) {
+      token = await gaRefreshOnce();
+      if (!token) { state.searchconsole = { ...state.searchconsole, rowsStatus: 'error' }; show(); return; }
+      res = await fetch(GSC_API + '/sites/' + encodeURIComponent(siteUrl) + '/searchAnalytics', { method: 'POST', headers: headers(), body });
+    }
+    if (res.status === 403) { state.searchconsole = { status: 'need-scope' }; show(); return; }
+    if (!res.ok) throw new Error('searchAnalytics-' + res.status);
+    const data = await res.json().catch(() => ({}));
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    state.searchconsole = { ...state.searchconsole, rows, rowsStatus: 'ready' };
+    show();
+  } catch {
+    state.searchconsole = { ...state.searchconsole, rowsStatus: 'error' };
+    show();
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
@@ -754,6 +908,8 @@ if (typeof window !== 'undefined') {
     isGoogleConfigured, isGoogleSignedIn, googleTokens, exchangeGoogleCode,
     googleSignOut, refreshGoogleToken, buildGoogleAuthUrl, GOOGLE_REDIRECT_URI, GOOGLE_IDS,
     GOOGLE_SCOPES, YOUTUBE_API, loadYouTube,
+    GA_ADMIN_API, GA_DATA_API, GSC_API, loadAnalytics, loadAnalyticsReport,
+    loadSearchConsole, loadSearchConsoleRows,
     GITHUB_CLIENT_ID_DEFAULT, GITHUB_REDIRECT_URI, GITHUB_SCOPES, GITHUB_AUTH_URL,
     OAUTH_PROXY_URL, GITHUB_API, buildGitHubAuthUrl, startGitHubSignIn,
     exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub };
@@ -823,6 +979,8 @@ function afterRender() {
   if (state.tab === 'voice' && !state.module) tickClock();
   if (state.module === 'youtube' && isGoogleSignedIn() && (state.youtube || {}).status === 'idle') loadYouTube();
   if (state.module === 'github' && isGitHubSignedIn() && (state.github || {}).status === 'idle') loadGitHub();
+  if (state.module === 'analytics' && isGoogleSignedIn() && (state.analytics || {}).status === 'idle') loadAnalytics();
+  if (state.module === 'searchconsole' && isGoogleSignedIn() && (state.searchconsole || {}).status === 'idle') loadSearchConsole();
 }
 
 /* ---------- HOME ---------- */
@@ -1174,6 +1332,8 @@ const MORE_ITEMS = [
   { id: 'connectors', icon: '🔗', title: 'Connectors' },
   { id: 'youtube', icon: '▶️', title: 'YouTube' },
   { id: 'github', icon: '🐙', title: 'GitHub' },
+  { id: 'analytics', icon: '📊', title: 'Analytics' },
+  { id: 'searchconsole', icon: '🔍', title: 'Search Console' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -1514,6 +1674,104 @@ const MODULES = {
           <div class="btnrow"><button class="btn" data-act="gh-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
       }
       return `<div class="card"><p class="muted">GitHub লোড হচ্ছে…</p></div>`;
+    },
+  },
+  analytics: {
+    id: 'analytics', icon: '📊', title: 'Analytics', hint: 'তোমার GA4 প্রপার্টি আর গত ৭ দিনের ভিজিটর — Google সাইন-ইন দিয়েই চলে (read-only)।',
+    render() {
+      if (!isGoogleSignedIn()) {
+        return `<div class="card"><h3>Connect Google first</h3>
+          <p class="muted">Analytics দেখতে তোমার Google অ্যাকাউন্ট কানেক্ট করো। এতে Analytics পারমিশনও চাওয়া হবে।</p>
+          <div class="btnrow"><button class="btn" data-act="google-signin">Connect Google</button></div></div>`;
+      }
+      const ga = state.analytics || { status: 'idle' };
+      if (ga.status === 'need-scope') {
+        return `<div class="card"><h3>Analytics যোগ হয়নি</h3>
+          <p class="muted">Analytics যোগ হয়নি — Google আবার কানেক্ট করো, এবার Analytics পারমিশনসহ। তোমার আগের Google কানেকশনে Analytics পারমিশন ছিল না।</p>
+          <div class="btnrow"><button class="btn" data-act="google-signin">Google আবার কানেক্ট করো</button></div></div>`;
+      }
+      if (ga.status === 'no-properties') {
+        return `<div class="card"><h3>কোনো Analytics প্রপার্টি পাওয়া যায়নি</h3>
+          <p class="muted">কোনো Analytics প্রপার্টি পাওয়া যায়নি — analytics.google.com-এ গিয়ে একটি প্রপার্টি বানাও, তারপর এখানে দেখতে পাবে।</p>
+          <div class="btnrow"><button class="btn" data-act="ga-open-site">Open Analytics</button></div></div>`;
+      }
+      if (ga.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Analytics ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="ga-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (ga.status === 'ready' && ga.properties) {
+        const totals = ga.report && ga.report.totals && ga.report.totals[0] && ga.report.totals[0].metricValues;
+        const val = (i) => (totals && totals[i] && totals[i].value !== undefined ? gaNum(totals[i].value) : '—');
+        const reportCard = ga.selected
+          ? ga.reportStatus === 'loading'
+            ? `<div class="card"><p class="muted">রিপোর্ট লোড হচ্ছে…</p></div>`
+            : ga.reportStatus === 'ready' && totals
+              ? `<div class="card"><h3>গত ৭ দিন — ${esc(ga.selected)}</h3>
+                <div style="display:flex;gap:16px;flex-wrap:wrap">
+                  <div><div style="font-size:18px;font-weight:700">${val(0)}</div><div class="s">Sessions</div></div>
+                  <div><div style="font-size:18px;font-weight:700">${val(1)}</div><div class="s">Users</div></div>
+                  <div><div style="font-size:18px;font-weight:700">${val(2)}</div><div class="s">Page views</div></div>
+                </div></div>`
+              : ga.reportStatus === 'error'
+                ? `<div class="card"><p class="muted">রিপোর্ট আনা যায়নি — আবার চেষ্টা করো।</p></div>`
+                : ''
+          : '';
+        return `<div class="card"><h3>GA4 properties</h3>
+          ${ga.properties.map(p => `<div class="list-item"><div><div class="t">${esc(p.displayName || p.name || '')}</div><div class="s">${esc(p.name || '')}</div></div>
+            <button class="btn small" data-act="ga-select" data-v="${esc(p.name || '')}">${ga.selected === p.name ? '✓ দেখছো' : 'দেখো'}</button></div>`).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="ga-refresh">↻ Refresh</button></div></div>
+        ${reportCard}`;
+      }
+      return `<div class="card"><p class="muted">Analytics লোড হচ্ছে…</p></div>`;
+    },
+  },
+  searchconsole: {
+    id: 'searchconsole', icon: '🔍', title: 'Search Console', hint: 'তোমার ভেরিফাই করা সাইট আর গত ৭ দিনের ক্লিক/ইমপ্রেশন — Google সাইন-ইন দিয়েই চলে (read-only)।',
+    render() {
+      if (!isGoogleSignedIn()) {
+        return `<div class="card"><h3>Connect Google first</h3>
+          <p class="muted">Search Console দেখতে তোমার Google অ্যাকাউন্ট কানেক্ট করো। এতে Search Console পারমিশনও চাওয়া হবে।</p>
+          <div class="btnrow"><button class="btn" data-act="google-signin">Connect Google</button></div></div>`;
+      }
+      const sc = state.searchconsole || { status: 'idle' };
+      if (sc.status === 'need-scope') {
+        return `<div class="card"><h3>Search Console যোগ হয়নি</h3>
+          <p class="muted">Search Console যোগ হয়নি — Google আবার কানেক্ট করো, এবার Search Console পারমিশনসহ। তোমার আগের Google কানেকশনে Search Console পারমিশন ছিল না।</p>
+          <div class="btnrow"><button class="btn" data-act="google-signin">Google আবার কানেক্ট করো</button></div></div>`;
+      }
+      if (sc.status === 'no-sites') {
+        return `<div class="card"><h3>কোনো সাইট ভেরিফাই করা নেই</h3>
+          <p class="muted">কোনো সাইট ভেরিফাই করা নেই — search.google.com/search-console-এ গিয়ে তোমার সাইট যোগ করো, তারপর এখানে দেখতে পাবে।</p>
+          <div class="btnrow"><button class="btn" data-act="gsc-open-site">Open Search Console</button></div></div>`;
+      }
+      if (sc.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Search Console ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="gsc-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (sc.status === 'ready' && sc.sites) {
+        const rowsCard = sc.selected
+          ? sc.rowsStatus === 'loading'
+            ? `<div class="card"><p class="muted">ডেটা লোড হচ্ছে…</p></div>`
+            : sc.rowsStatus === 'ready' && sc.rows
+              ? `<div class="card"><h3>গত ৭ দিন — ${esc(sc.selected)}</h3>
+                ${sc.rows.length ? `<table style="width:100%;border-collapse:collapse;font-size:13px">
+                  <tr style="text-align:left;border-bottom:1px solid #e5e7eb"><th style="padding:4px 2px">তারিখ</th><th style="padding:4px 2px">Clicks</th><th style="padding:4px 2px">Impressions</th><th style="padding:4px 2px">CTR</th><th style="padding:4px 2px">Position</th></tr>
+                  ${sc.rows.map(r => `<tr style="border-bottom:1px solid #f0f0f5"><td style="padding:4px 2px">${esc((r.keys && r.keys[0]) || '')}</td><td style="padding:4px 2px">${gaNum(r.clicks)}</td><td style="padding:4px 2px">${gaNum(r.impressions)}</td><td style="padding:4px 2px">${((Number(r.ctr || 0) * 100).toFixed(1))}%</td><td style="padding:4px 2px">${Number(r.position || 0).toFixed(1)}</td></tr>`).join('')}
+                </table>` : emptyNote('গত ৭ দিনে কোনো ক্লিক/ইমপ্রেশন নেই।')}
+              </div>`
+              : sc.rowsStatus === 'error'
+                ? `<div class="card"><p class="muted">ডেটা আনা যায়নি — আবার চেষ্টা করো।</p></div>`
+                : ''
+          : '';
+        return `<div class="card"><h3>Verified sites</h3>
+          ${sc.sites.map(s => `<div class="list-item"><div><div class="t">${esc(s.siteUrl || '')}</div><div class="s">${esc(s.permissionLevel || '')}</div></div>
+            <button class="btn small" data-act="gsc-select" data-v="${esc(s.siteUrl || '')}">${sc.selected === s.siteUrl ? '✓ দেখছো' : 'দেখো'}</button></div>`).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="gsc-refresh">↻ Refresh</button></div></div>
+        ${rowsCard}`;
+      }
+      return `<div class="card"><p class="muted">Search Console লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -2205,8 +2463,11 @@ const ACTS = {
   },
   'conn-google'(el) {
     // Google-kind connectors reuse the existing real Google OAuth flow.
-    // YouTube is special: when already signed in, open the channel view.
-    if (el.dataset.v === 'youtube' && isGoogleSignedIn()) { openModule('youtube'); return; }
+    // YouTube / Analytics / Search Console are special: when already signed
+    // in, open the data view instead of signing out.
+    const openModules = { youtube: 'youtube', 'google-analytics': 'analytics', 'google-search-console': 'searchconsole' };
+    const mod = openModules[el.dataset.v];
+    if (mod && isGoogleSignedIn()) { openModule(mod); return; }
     if (isGoogleSignedIn()) { googleSignOut(); return; }
     startGoogleSignIn();
   },
@@ -2217,6 +2478,20 @@ const ACTS = {
   },
   'yt-open-site'() { openConnUrl('https://www.youtube.com'); },
   'yt-refresh'() { state.youtube = { status: 'idle' }; render(); },
+  'ga-refresh'() { state.analytics = { status: 'idle' }; render(); },
+  'ga-open-site'() { openConnUrl('https://analytics.google.com'); },
+  'ga-select'(el) {
+    const p = (el.dataset.v || '').trim();
+    if (!p) return;
+    loadAnalyticsReport(p);
+  },
+  'gsc-refresh'() { state.searchconsole = { status: 'idle' }; render(); },
+  'gsc-open-site'() { openConnUrl('https://search.google.com/search-console'); },
+  'gsc-select'(el) {
+    const s = (el.dataset.v || '').trim();
+    if (!s) return;
+    loadSearchConsoleRows(s);
+  },
   'conn-open'(el) {
     const c = CONNECTORS.find(x => x.id === el.dataset.v);
     if (!c) return;
