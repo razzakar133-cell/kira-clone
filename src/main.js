@@ -107,10 +107,7 @@ const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 const GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo';
 const GOOGLE_IDS = ['google', 'gmail', 'drive', 'gcal'];
 /* YouTube Data API v3 (read-only, free quota) — uses the same Google OAuth
-   tokens as Gmail/Drive/Calendar (scope youtube.readonly, added above).
-   Pattern for the next provider: each provider needs its own OAuth client
-   ID + secret and a repo-secret injection step like GOOGLE_CLIENT_SECRET
-   (e.g. GitHub OAuth will need its own client ID/secret + workflow step). */
+   tokens as Gmail/Drive/Calendar (scope youtube.readonly, added above). */
 const YOUTUBE_API = 'https://www.googleapis.com/youtube/v3';
 const googleClientId = () => { const v = (store.get('google_client_id', '') || '').trim(); return v || GOOGLE_CLIENT_ID_DEFAULT; };
 /* Secret resolution: built-in value injected at build time wins; otherwise the
@@ -310,6 +307,79 @@ async function googleSignOut() {
   toast('Signed out of Google.');
   render();
 }
+
+/* ---------- GitHub OAuth (free) via the Cloudflare Worker proxy ----------
+   GitHub's token endpoint blocks direct browser fetches (no CORS headers),
+   so the authorization code is exchanged through a small free Worker proxy
+   at OAUTH_PROXY_URL (https://kira-oauth.razzakar133.workers.dev/). The
+   Worker holds the client secret as an env var — the app NEVER contains or
+   sends the client secret. The client ID is public (OAuth App "Kira Clone").
+   Scopes are read-only: read:user, user:email, public_repo.
+   Pattern for future providers: each needs its own OAuth client ID + secret
+   stored as a Worker env var, and a matching `provider` branch in the Worker.
+   Tokens + profile are stored on this device only (kira_github_tokens,
+   kira_github_profile). api.github.com allows CORS, so profile/repo fetches
+   go direct from the app. */
+const GITHUB_CLIENT_ID_DEFAULT = 'Ov23licDE7nLwFTa3Tky';
+const GITHUB_REDIRECT_URI = 'https://razzakar133-cell.github.io/kira-clone/oauth.html';
+const GITHUB_SCOPES = 'read:user user:email public_repo';
+const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
+const OAUTH_PROXY_URL = 'https://kira-oauth.razzakar133.workers.dev/';
+const GITHUB_API = 'https://api.github.com';
+const githubTokens = () => store.get('github_tokens', null);
+const isGitHubSignedIn = () => { const t = githubTokens(); return !!(t && t.access_token); };
+function buildGitHubAuthUrl() {
+  const params = new URLSearchParams({
+    client_id: GITHUB_CLIENT_ID_DEFAULT,
+    redirect_uri: GITHUB_REDIRECT_URI,
+    scope: GITHUB_SCOPES,
+  });
+  return GITHUB_AUTH_URL + '?' + params.toString();
+}
+async function startGitHubSignIn() {
+  const url = buildGitHubAuthUrl();
+  state.githubManualUrl = url;
+  // Primary flow: open the GitHub sign-in page in the system browser.
+  // GitHub redirects to oauth.html, which shows the code to paste back here.
+  if (isNativeApp()) {
+    try { await Browser.open({ url }); } catch {}
+  } else {
+    try { window.open(url, '_blank'); } catch {}
+  }
+  openModule('github-signin');
+}
+/* Exchange the pasted code for a token THROUGH the Worker proxy. The request
+   carries only provider + code + redirect_uri — never a client secret. */
+async function exchangeGitHubCode(code) {
+  const res = await fetch(OAUTH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'github', code, redirect_uri: GITHUB_REDIRECT_URI }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) throw new Error(data.error || 'token-exchange-failed');
+  store.set('github_tokens', {
+    access_token: data.access_token,
+    token_type: data.token_type || 'bearer',
+    scope: data.scope || '',
+    created_at: Date.now(),
+  });
+  // Fetch the profile now so the connector card can show "Connected · login".
+  try {
+    const r = await fetch(GITHUB_API + '/user', { headers: { Authorization: 'Bearer ' + data.access_token, Accept: 'application/vnd.github+json' } });
+    if (r.ok) store.set('github_profile', await r.json());
+  } catch {}
+  state.github = { status: 'idle' };
+  return true;
+}
+function githubSignOut() {
+  store.del('github_tokens');
+  store.del('github_profile');
+  state.github = { status: 'idle' };
+  toast('GitHub disconnected.');
+  render();
+}
+
 /* ---------- app state ---------- */
 const state = {
   tab: 'home',            // home | chats | voice | automate | more
@@ -325,9 +395,11 @@ const state = {
   voiceLang: store.get('voice_lang', 'bn-BD'),
   pinned: store.get('pinned', ['messages', 'smart-calendar', 'meal-planner']),
   googleManualUrl: '', // Google auth URL shown in the sign-in module (copy link + paste code)
+  githubManualUrl: '', // GitHub auth URL shown in the sign-in module (copy link + paste code)
   connSearch: '', // Connectors directory search text (kept across re-renders)
   connKeyFor: null, // id of the key connector whose inline API-key form is open
   youtube: { status: 'idle' }, // YouTube channel cache: idle|loading|ready|need-scope|no-channel|error
+  github: { status: 'idle' }, // GitHub profile+repos cache: idle|loading|ready|need-signin|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -369,10 +441,12 @@ const SOCIALS = [
 
 /* ---------- Connectors directory (100 services, 10 categories) ----------
    kind: 'google' = real Google OAuth (reuses the existing sign-in flow);
+   'oauth' = real OAuth via the Worker proxy (GitHub — see GITHUB_* above);
    'key' = API key saved on this device only; 'link' = opens the official site.
    Connection state lives in localStorage under kira_connectors_v1 as
-   { [id]: 'google' | 'key' | 'opened' }. Google entries read the live
-   token state (kira_google_tokens) instead of that store. */
+   { [id]: 'google' | 'key' | 'opened' }. Google and OAuth entries read the
+   live token state (kira_google_tokens / kira_github_tokens) instead of
+   that store. */
 const CONNECTOR_CATS = [
   'Social Media ও Facebook Management',
   'AI ও Automation',
@@ -464,7 +538,7 @@ const CONNECTORS = [
   { id: 'wetransfer', name: 'WeTransfer', icon: '📤', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://wetransfer.com' },
   { id: 'google-keep', name: 'Google Keep', icon: '📌', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://keep.google.com' },
   // 8. Website ও Development
-  { id: 'github', name: 'GitHub', icon: '🐙', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://github.com' },
+  { id: 'github', name: 'GitHub', icon: '🐙', cat: CONNECTOR_CATS[7], kind: 'oauth', url: 'https://github.com' },
   { id: 'gitlab', name: 'GitLab', icon: '🦊', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://gitlab.com' },
   { id: 'bitbucket', name: 'Bitbucket', icon: '🪣', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://bitbucket.org' },
   { id: 'vercel', name: 'Vercel', icon: '▲', cat: CONNECTOR_CATS[7], kind: 'link', url: 'https://vercel.com' },
@@ -514,6 +588,13 @@ function connStatus(c, con) {
     }
     return 'Not connected';
   }
+  if (c.kind === 'oauth' && c.id === 'github') {
+    if (isGitHubSignedIn()) {
+      const p = store.get('github_profile', null);
+      return 'Connected · ' + ((p && p.login) || 'GitHub account');
+    }
+    return 'Not connected';
+  }
   if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
     return k ? 'Connected · key ' + maskKey(k) : 'Not connected · needs API key';
@@ -536,6 +617,12 @@ function connCard(c, con) {
       : isGoogleSignedIn()
         ? `<button class="btn ghost small" data-act="conn-google" data-v="${c.id}">Disconnect</button>`
         : `<button class="btn small" data-act="conn-google" data-v="${c.id}">Connect</button>`;
+  } else if (c.kind === 'oauth') {
+    // GitHub: when signed in, Open shows the profile/repos view and
+    // Disconnect clears the tokens; otherwise Connect starts OAuth.
+    btn = isGitHubSignedIn()
+      ? `<button class="btn small" data-act="conn-oauth" data-v="${c.id}">Open</button><button class="btn ghost small" data-act="conn-oauth-disconnect" data-v="${c.id}">Disconnect</button>`
+      : `<button class="btn small" data-act="conn-oauth" data-v="${c.id}">Connect</button>`;
   } else if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
     btn = k
@@ -621,13 +708,55 @@ async function loadYouTube() {
   }
 }
 
+/* ---------- GitHub (real OAuth via the Worker proxy, read-only scopes) ---------- */
+function ghNum(n) { const v = Number(n || 0); return v.toLocaleString('en-US'); }
+function fmtGhDate(s) {
+  try { return new Date(s).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch { return s || ''; }
+}
+/* Load the signed-in user's GitHub profile + latest 10 repos into
+   state.github. Runs from afterRender when the github module is open.
+   Profile is cached in store (kira_github_profile); repos refetch each
+   time. 401 = token rejected (clears tokens, reconnect needed). Never
+   shows raw API errors to the user. */
+async function loadGitHub() {
+  if (!isGitHubSignedIn()) return;
+  if (state.github.status === 'loading') return;
+  state.github = { status: 'loading' };
+  const show = () => { if (state.module === 'github') render(); };
+  const token = githubTokens().access_token;
+  const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' };
+  try {
+    let profile = store.get('github_profile', null);
+    if (!profile) {
+      const res = await fetch(GITHUB_API + '/user', { headers });
+      if (res.status === 401) { githubSignOut(); state.github = { status: 'need-signin' }; show(); return; }
+      if (!res.ok) throw new Error('user-' + res.status);
+      profile = await res.json();
+      store.set('github_profile', profile);
+    }
+    const rres = await fetch(GITHUB_API + '/user/repos?sort=updated&per_page=10', { headers });
+    if (rres.status === 401) { githubSignOut(); state.github = { status: 'need-signin' }; show(); return; }
+    if (!rres.ok) throw new Error('repos-' + rres.status);
+    const repos = await rres.json().catch(() => []);
+    state.github = { status: 'ready', profile, repos: Array.isArray(repos) ? repos : [] };
+    show();
+  } catch {
+    state.github = { status: 'error' };
+    show();
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
     pkceChallenge, makeVerifier, googleClientId, googleClientSecret, resolveGoogleSecret,
     isGoogleConfigured, isGoogleSignedIn, googleTokens, exchangeGoogleCode,
     googleSignOut, refreshGoogleToken, buildGoogleAuthUrl, GOOGLE_REDIRECT_URI, GOOGLE_IDS,
-    GOOGLE_SCOPES, YOUTUBE_API, loadYouTube };
+    GOOGLE_SCOPES, YOUTUBE_API, loadYouTube,
+    GITHUB_CLIENT_ID_DEFAULT, GITHUB_REDIRECT_URI, GITHUB_SCOPES, GITHUB_AUTH_URL,
+    OAUTH_PROXY_URL, GITHUB_API, buildGitHubAuthUrl, startGitHubSignIn,
+    exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub };
 }
 
 /* ---------- shell & router ---------- */
@@ -693,6 +822,7 @@ function afterRender() {
   if (state.tab === 'chats' && !state.module) { const m = $('#chatMsgs'); if (m) m.scrollTop = m.scrollHeight; }
   if (state.tab === 'voice' && !state.module) tickClock();
   if (state.module === 'youtube' && isGoogleSignedIn() && (state.youtube || {}).status === 'idle') loadYouTube();
+  if (state.module === 'github' && isGitHubSignedIn() && (state.github || {}).status === 'idle') loadGitHub();
 }
 
 /* ---------- HOME ---------- */
@@ -1043,6 +1173,7 @@ const MORE_ITEMS = [
   { id: 'social-media', icon: '🔗', title: 'Social Media' },
   { id: 'connectors', icon: '🔗', title: 'Connectors' },
   { id: 'youtube', icon: '▶️', title: 'YouTube' },
+  { id: 'github', icon: '🐙', title: 'GitHub' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -1347,6 +1478,42 @@ const MODULES = {
           <div class="btnrow"><button class="btn" data-act="yt-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
       }
       return `<div class="card"><p class="muted">YouTube চ্যানেল লোড হচ্ছে…</p></div>`;
+    },
+  },
+  github: {
+    id: 'github', icon: '🐙', title: 'GitHub', hint: 'তোমার GitHub প্রোফাইল আর রিপো — আসল লগইন (read-only)।',
+    render() {
+      // need-signin is checked FIRST: a 401 signs the user out (tokens are
+      // cleared), so the signed-in guard below would otherwise hide it.
+      const gh = state.github || { status: 'idle' };
+      if (gh.status === 'need-signin') {
+        return `<div class="card"><h3>GitHub আবার কানেক্ট করো</h3>
+          <p class="muted">GitHub লগইন শেষ হয়ে গেছে — আবার কানেক্ট করো।</p>
+          <div class="btnrow"><button class="btn" data-act="github-signin">GitHub আবার কানেক্ট করো</button></div></div>`;
+      }
+      if (!isGitHubSignedIn()) {
+        return `<div class="card"><h3>Connect GitHub first</h3>
+          <p class="muted">GitHub দেখতে তোমার GitHub অ্যাকাউন্ট কানেক্ট করো। এতে শুধু পড়ার (read-only) পারমিশন চাওয়া হবে।</p>
+          <div class="btnrow"><button class="btn" data-act="github-signin">Connect GitHub</button></div></div>`;
+      }
+      if (gh.status === 'ready' && gh.profile) {
+        const p = gh.profile;
+        return `<div class="card"><div class="list-item" style="border:none;padding:0"><div style="display:flex;gap:10px;align-items:center">
+          ${p.avatar_url ? `<img src="${esc(p.avatar_url)}" alt="" style="width:56px;height:56px;border-radius:50%;object-fit:cover">` : '<span style="font-size:40px">🐙</span>'}
+          <div><div class="t" style="font-size:18px">${esc(p.name || p.login || 'GitHub')}</div>
+          <div class="s">@${esc(p.login || '')} · ${ghNum(p.public_repos)} repos · ${ghNum(p.followers)} followers · ${ghNum(p.following)} following</div></div></div>
+          <div style="display:flex;gap:6px"><button class="btn ghost small" data-act="gh-refresh">↻ Refresh</button><button class="btn ghost small" data-act="conn-oauth-disconnect" data-v="github">Disconnect</button></div></div></div>
+        <div class="card"><h3>Latest repos</h3>
+          ${gh.repos && gh.repos.length ? gh.repos.map(r => `<div class="list-item"><div><div class="t">${esc(r.name || '')}</div><div class="s">${esc(r.description || '')}${r.language ? ' · ' + esc(r.language) : ''} · ⭐ ${ghNum(r.stargazers_count)} · ${fmtGhDate(r.updated_at)}</div></div>
+            <button class="btn small" data-act="gh-open" data-v="${esc(r.html_url || '')}">Open</button></div>`).join('') : emptyNote('No repos found yet.')}
+        </div>`;
+      }
+      if (gh.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">GitHub ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="gh-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      return `<div class="card"><p class="muted">GitHub লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -1696,6 +1863,21 @@ Object.assign(MODULES, {
       <div class="note">Your Google account is used read-only (Gmail, Drive, Calendar). Tokens stay on this device.</div>`;
     },
   },
+  'github-signin': {
+    id: 'github-signin', icon: '🐙', title: 'Sign in with GitHub', hint: 'Paste the code from the GitHub redirect page.',
+    render() {
+      const url = state.githubManualUrl || '';
+      return `<div class="card"><p class="s">Sign in with GitHub in the browser that just opened:</p>
+      <label class="lbl">1. The GitHub sign-in link</label>
+      <div class="field" style="word-break:break-all;white-space:normal">${esc(url)}</div>
+      <div class="btnrow"><button class="btn small" data-act="copy-link" data-v="${esc(url)}">Copy link</button></div>
+      <p class="s">2. After signing in, GitHub opens a page that shows your authorization code. Copy the code from that page and paste it below.</p>
+      <form id="f-github-code"><label class="lbl">3. Paste the authorization code</label>
+      <input class="field" name="code" placeholder="Paste the code…" required>
+      <button class="btn" type="submit">Complete sign-in</button></form></div>
+      <div class="note">GitHub is used read-only (your profile and public repos). The code is exchanged through a small proxy — your token stays on this device.</div>`;
+    },
+  },
   notifications: {
     id: 'notifications', icon: '🔔', title: 'Notifications', hint: 'Recent activity.',
     render() {
@@ -1800,6 +1982,15 @@ const FORMS = {
       toast('Signed in with Google' + (t && t.email ? ' as ' + t.email : '') + '.');
       closeModule();
     }).catch(() => toast('That code did not work — try signing in again.'));
+  },
+  'f-github-code'(f) {
+    const code = (f.get('code') || '').trim();
+    if (!code) return;
+    exchangeGitHubCode(code).then(() => {
+      const p = store.get('github_profile', null);
+      toast('Signed in with GitHub' + (p && p.login ? ' as ' + p.login : '') + '.');
+      openModule('github');
+    }).catch(() => toast('কোডটি হয়নি — আবার চেষ্টা করো'));
   },
   'f-cal-add'(f) { const evs = store.get('events', []); evs.push({ id: uid(), title: f.get('title').trim(), date: f.get('date'), time: f.get('time') || '' }); store.set('events', evs); render(); },
   'f-rem-add'(f) { const r = store.get('reminders', []); r.push({ id: uid(), text: f.get('text').trim(), time: f.get('time') || '' }); store.set('reminders', r); render(); },
@@ -2043,6 +2234,22 @@ const ACTS = {
     toast('API key removed.');
     render();
   },
+  'conn-oauth'(el) {
+    // OAuth-kind connectors (GitHub) go through the Worker proxy flow.
+    if (el.dataset.v === 'github') {
+      if (isGitHubSignedIn()) { openModule('github'); return; }
+      startGitHubSignIn();
+    }
+  },
+  'conn-oauth-disconnect'(el) {
+    if (el.dataset.v === 'github') githubSignOut();
+  },
+  'gh-open'(el) {
+    const u = (el.dataset.v || '').trim();
+    if (u) openConnUrl(u);
+  },
+  'gh-refresh'() { state.github = { status: 'idle' }; render(); },
+  'github-signin'() { startGitHubSignIn(); },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
