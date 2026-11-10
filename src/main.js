@@ -413,6 +413,7 @@ const state = {
   analytics: { status: 'idle' }, // GA4 properties + report cache: idle|loading|ready|need-scope|no-properties|error
   searchconsole: { status: 'idle' }, // Search Console sites + rows cache: idle|loading|ready|need-scope|no-sites|error
   notion: { status: 'idle' }, // Notion shared pages cache: idle|loading|ready|empty|not-configured|error
+  slack: { status: 'idle' }, // Slack channels cache: idle|loading|ready|empty|not-configured|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -455,7 +456,7 @@ const SOCIALS = [
 /* ---------- Connectors directory (100 services, 10 categories) ----------
    kind: 'google' = real Google OAuth (reuses the existing sign-in flow);
    'oauth' = real OAuth via the Worker proxy (GitHub — see GITHUB_* above);
-   'worker' = Worker-backed integration (Notion — the token lives in the
+   'worker' = Worker-backed integration (Notion, Slack — the token lives in the
    Worker, the app never sees it); 'key' = API key saved on this device
    only; 'link' = opens the official site.
    Connection state lives in localStorage under kira_connectors_v1 as
@@ -534,7 +535,7 @@ const CONNECTORS = [
   { id: 'zoom', name: 'Zoom', icon: '📹', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://zoom.us' },
   { id: 'google-meet', name: 'Google Meet', icon: '🎥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://meet.google.com' },
   { id: 'microsoft-teams', name: 'Microsoft Teams', icon: '👥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://teams.microsoft.com' },
-  { id: 'slack', name: 'Slack', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://slack.com' },
+  { id: 'slack', name: 'Slack', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'worker', url: 'https://slack.com' },
   { id: 'discord', name: 'Discord', icon: '🎮', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://discord.com' },
   { id: 'telegram', name: 'Telegram', icon: '✈️', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://web.telegram.org' },
   { id: 'skype', name: 'Skype', icon: '📞', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.skype.com' },
@@ -613,6 +614,10 @@ function connStatus(c, con) {
   if (c.kind === 'worker' && c.id === 'notion') {
     // Connected once the Notion module has loaded successfully at least once.
     return store.get('notion_ok', '') === '1' ? 'Connected' : 'Open';
+  }
+  if (c.kind === 'worker' && c.id === 'slack') {
+    // Connected once the Slack module has loaded successfully at least once.
+    return store.get('slack_ok', '') === '1' ? 'Connected' : 'Open';
   }
   if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
@@ -1002,6 +1007,99 @@ async function loadNotionPage(pageId) {
   }
 }
 
+/* ---------- Slack (free integration, via the Worker proxy) ----------
+   The Slack bot token lives in the Worker as a secret env var
+   (SLACK_BOT_TOKEN); the app NEVER contains or sends the token. Every
+   Slack call goes through the same Worker proxy as GitHub and Notion,
+   with { provider: 'slack', path, method, body }; the Worker adds the
+   Authorization header server-side and returns the Slack API JSON (or
+   { error } on failure). IMPORTANT: a Slack bot only sees channels it
+   was invited to (Slack → channel → Integrations → Add apps → the Kira
+   Clone bot). Uninvited channels never appear, so the module explains
+   that in Bengali when the list is empty. */
+async function slackCall(path, method = 'GET', body = null) {
+  const res = await fetch(OAUTH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'slack', path, method, body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || 'proxy_error');
+  return data;
+}
+function slackMsgTime(ts) {
+  try {
+    const d = new Date(parseFloat(ts) * 1000);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+/* Load the channels the bot was invited to into state.slack. Runs from
+   afterRender when the slack module is open. Sets kira_slack_ok = '1' on
+   the first successful list so the connector card can show Connected.
+   'not-configured' = the Worker has no Slack bot token yet. Never shows
+   raw API errors to the user. */
+async function loadSlack() {
+  if (state.slack.status === 'loading') return;
+  state.slack = { status: 'loading' };
+  const show = () => { if (state.module === 'slack') render(); };
+  try {
+    const data = await slackCall('/conversations.list', 'GET', { exclude_archived: true, limit: 20 });
+    const channels = Array.isArray(data.channels) ? data.channels : [];
+    store.set('slack_ok', '1');
+    if (!channels.length) { state.slack = { status: 'empty' }; show(); return; }
+    state.slack = { status: 'ready', channels, selected: null, messages: null, msgsStatus: 'idle', userNames: {} };
+    show();
+  } catch (e) {
+    if (e && e.message === 'not_configured') state.slack = { status: 'not-configured' };
+    else state.slack = { status: 'error' };
+    show();
+  }
+}
+/* Load the last 10 messages of one channel into state.slack.messages,
+   resolving author display names via users.info (cached in
+   state.slack.userNames). */
+async function loadSlackHistory(channelId) {
+  const cur = state.slack || {};
+  if (cur.msgsStatus === 'loading') return;
+  state.slack = { ...cur, selected: channelId, messages: null, msgsStatus: 'loading' };
+  const show = () => { if (state.module === 'slack') render(); };
+  show();
+  try {
+    const data = await slackCall('/conversations.history', 'GET', { channel: channelId, limit: 10 });
+    const messages = Array.isArray(data.messages) ? data.messages : [];
+    state.slack = { ...state.slack, messages, msgsStatus: 'ready' };
+    show();
+    const ids = [...new Set(messages.map(m => m.user).filter(Boolean))]
+      .filter(id => !(state.slack.userNames || {})[id]);
+    for (const id of ids) {
+      try {
+        const u = await slackCall('/users.info', 'GET', { user: id });
+        const name = u.user && (u.user.real_name || (u.user.profile && u.user.profile.display_name) || u.user.name);
+        if (name) state.slack.userNames[id] = name;
+      } catch {}
+    }
+    if (ids.length) show();
+  } catch {
+    state.slack = { ...state.slack, msgsStatus: 'error' };
+    show();
+  }
+}
+/* Post the composer's text to the selected channel, then reload history. */
+async function sendSlackMessage() {
+  const input = typeof document !== 'undefined' ? document.querySelector('#slackMsgInput') : null;
+  const text = (input && input.value || '').trim();
+  const cur = state.slack || {};
+  if (!text || !cur.selected) return;
+  try {
+    await slackCall('/chat.postMessage', 'POST', { channel: cur.selected, text });
+    if (input) input.value = '';
+    await loadSlackHistory(cur.selected);
+  } catch {
+    toast('মেসেজ পাঠানো যায়নি — আবার চেষ্টা করো।');
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
@@ -1014,7 +1112,8 @@ if (typeof window !== 'undefined') {
     GITHUB_CLIENT_ID_DEFAULT, GITHUB_REDIRECT_URI, GITHUB_SCOPES, GITHUB_AUTH_URL,
     OAUTH_PROXY_URL, GITHUB_API, buildGitHubAuthUrl, startGitHubSignIn,
     exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub,
-    notionCall, loadNotion, loadNotionPage, notionTitle, notionBlockText };
+    notionCall, loadNotion, loadNotionPage, notionTitle, notionBlockText,
+    slackCall, loadSlack, loadSlackHistory, sendSlackMessage };
 }
 
 /* ---------- shell & router ---------- */
@@ -1084,6 +1183,7 @@ function afterRender() {
   if (state.module === 'analytics' && isGoogleSignedIn() && (state.analytics || {}).status === 'idle') loadAnalytics();
   if (state.module === 'searchconsole' && isGoogleSignedIn() && (state.searchconsole || {}).status === 'idle') loadSearchConsole();
   if (state.module === 'notion' && (state.notion || {}).status === 'idle') loadNotion();
+  if (state.module === 'slack' && (state.slack || {}).status === 'idle') loadSlack();
 }
 
 /* ---------- HOME ---------- */
@@ -1438,6 +1538,7 @@ const MORE_ITEMS = [
   { id: 'analytics', icon: '📊', title: 'Analytics' },
   { id: 'searchconsole', icon: '🔍', title: 'Search Console' },
   { id: 'notion', icon: '📝', title: 'Notion' },
+  { id: 'slack', icon: '💬', title: 'Slack' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -1630,7 +1731,7 @@ const MODULES = {
     },
   },
   integrations: {
-    id: 'integrations', icon: '🔌', title: 'Integrations', hint: 'Google, GitHub, YouTube, Analytics, Search Console and Notion are real — Slack is still demo.',
+    id: 'integrations', icon: '🔌', title: 'Integrations', hint: 'Google, GitHub, YouTube, Analytics, Search Console, Notion and Slack are real.',
     render() {
       const con = store.get('integrations', {});
       const gt = googleTokens();
@@ -1647,7 +1748,7 @@ const MODULES = {
         return `<div class="list-item"><div><div class="t">${i.icon} ${i.name}</div><div class="s">${status}</div></div>
         <button class="btn ${real || demo ? 'ghost' : ''} small" data-act="int-connect" data-v="${i.id}">${btn}</button></div>`;
       }).join('')}</div>
-      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Notion is real now — see More → Connectors → Notion (pages shared with the Kira Clone integration appear there). Slack is still a demo connection — real access would need its official OAuth. Jewel opens your personal agent chat (muse.ai) — the app that solves the problems this app cannot.</div>`;
+      <div class="note">Google, Gmail, Drive and Calendar sign you in with your real Google account (read-only scopes). Tokens stay on this device. Notion is real now — see More → Connectors → Notion (pages shared with the Kira Clone integration appear there). Slack is real now too — see More → Connectors → Slack (channels the bot was invited to appear there). Jewel opens your personal agent chat (muse.ai) — the app that solves the problems this app cannot.</div>`;
     },
   },
   workflows: {
@@ -1918,6 +2019,46 @@ const MODULES = {
         ${blocksCard}`;
       }
       return `<div class="card"><p class="muted">Notion লোড হচ্ছে…</p></div>`;
+    },
+  },
+  slack: {
+    id: 'slack', icon: '💬', title: 'Slack', hint: 'তোমার Slack চ্যানেল আর মেসেজ — ফ্রি ইন্টিগ্রেশন। বটকে চ্যানেলে Invite করলেই সেগুলো দেখা যাবে।',
+    render() {
+      const st = state.slack || { status: 'idle' };
+      if (st.status === 'not-configured') {
+        return `<div class="card"><h3>Slack এখনো সেটআপ হয়নি</h3>
+          <p class="muted">Slack এখনো সেটআপ হয়নি — একটু পরে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="slack-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'empty') {
+        return `<div class="card"><h3>কোনো চ্যানেল দেখা যাচ্ছে না</h3>
+          <p class="muted">Slack-এ কোনো চ্যানেল দেখা যাচ্ছে না — Slack-এ গিয়ে বটকে চ্যানেলে Invite করো, তারপর এখানে Refresh চাপো।</p>
+          <div class="btnrow"><button class="btn" data-act="slack-refresh">↻ Refresh</button><button class="btn ghost" data-act="slack-open-site">Open Slack</button></div></div>`;
+      }
+      if (st.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Slack ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="slack-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'ready' && st.channels) {
+        const sel = st.channels.find(c => c.id === st.selected);
+        const msgsCard = st.selected
+          ? st.msgsStatus === 'loading'
+            ? `<div class="card"><p class="muted">মেসেজ লোড হচ্ছে…</p></div>`
+            : st.msgsStatus === 'ready'
+              ? `<div class="card"><div class="btnrow"><button class="btn ghost small" data-act="slack-back">← Back to channels</button></div>
+                  <h3 style="margin:8px 0">#${esc(sel ? sel.name : '')}</h3>
+                  ${(st.messages || []).map(m => `<p style="margin:6px 0"><b>${esc(((st.userNames || {})[m.user]) || m.user || 'Slack')}</b> <span class="muted">${esc(slackMsgTime(m.ts))}</span><br>${esc(m.text || '')}</p>`).join('') || emptyNote('এই চ্যানেলে এখনো কোনো মেসেজ নেই।')}
+                  <div class="btnrow" style="margin-top:10px"><input id="slackMsgInput" placeholder="মেসেজ লেখো…" style="flex:1"><button class="btn" data-act="slack-send">Send</button></div></div>`
+              : `<div class="card"><p class="muted">মেসেজ আনা যায়নি — আবার চেষ্টা করো।</p><div class="btnrow"><button class="btn ghost small" data-act="slack-back">← Back</button></div></div>`
+          : '';
+        return `<div class="card"><h3>Channels</h3>
+          ${st.channels.map(c => `<div class="list-item"><div><div class="t">#${esc(c.name || '')}</div><div class="s">${typeof c.num_members === 'number' ? c.num_members + ' জন সদস্য' : 'Channel'}</div></div>
+            <button class="btn small" data-act="slack-channel" data-v="${esc(c.id || '')}">${st.selected === c.id ? '✓ দেখছো' : 'Open'}</button></div>`).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="slack-refresh">↻ Refresh</button></div></div>
+        ${msgsCard}`;
+      }
+      return `<div class="card"><p class="muted">Slack লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -2672,8 +2813,9 @@ const ACTS = {
   'gh-refresh'() { state.github = { status: 'idle' }; render(); },
   'github-signin'() { startGitHubSignIn(); },
   'conn-worker'(el) {
-    // Worker-backed connectors (Notion): Open shows the in-app module.
+    // Worker-backed connectors (Notion, Slack): Open shows the in-app module.
     if (el.dataset.v === 'notion') openModule('notion');
+    if (el.dataset.v === 'slack') openModule('slack');
   },
   'notion-refresh'() { state.notion = { status: 'idle' }; render(); },
   'notion-open-site'() { openConnUrl('https://www.notion.so'); },
@@ -2690,6 +2832,18 @@ const ACTS = {
     state.notion = { ...state.notion, selected: null, blocks: null, blocksStatus: 'idle' };
     render();
   },
+  'slack-refresh'() { state.slack = { status: 'idle' }; render(); },
+  'slack-open-site'() { openConnUrl('https://slack.com'); },
+  'slack-channel'(el) {
+    const id = (el.dataset.v || '').trim();
+    if (!id) return;
+    loadSlackHistory(id);
+  },
+  'slack-back'() {
+    state.slack = { ...state.slack, selected: null, messages: null, msgsStatus: 'idle' };
+    render();
+  },
+  'slack-send'() { sendSlackMessage(); },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
