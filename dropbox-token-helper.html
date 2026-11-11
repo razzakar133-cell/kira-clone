@@ -77,9 +77,21 @@
     btn.addEventListener('click', function () {
       var el = document.getElementById(btn.getAttribute('data-t'));
       var t = (el.value !== undefined) ? el.value : el.textContent;
-      if (navigator.clipboard) { navigator.clipboard.writeText(t); }
-      btn.textContent = 'Copied ✓';
-      setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+      function done(ok) {
+        btn.textContent = ok ? 'Copied ✓' : 'কপি হয়নি — বাক্সে চাপ দিয়ে সিলেক্ট করো';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
+      }
+      function fallback() {
+        try {
+          el.focus();
+          el.select();
+          var ok = document.execCommand('copy');
+          done(ok);
+        } catch (e) { done(false); }
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t).then(function () { done(true); }, fallback);
+      } else { fallback(); }
     });
   });
   var keyInput = document.getElementById('key');
