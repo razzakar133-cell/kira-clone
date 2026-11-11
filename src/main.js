@@ -415,6 +415,7 @@ const state = {
   notion: { status: 'idle' }, // Notion shared pages cache: idle|loading|ready|empty|not-configured|error
   slack: { status: 'idle' }, // Slack channels cache: idle|loading|ready|empty|not-configured|error
   dropbox: { status: 'idle', path: '' }, // Dropbox folder cache: idle|loading|ready|empty|not-configured|error; path '' = root
+  telegram: { status: 'idle' }, // Telegram chats cache: idle|loading|ready|empty|not-configured|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -538,7 +539,7 @@ const CONNECTORS = [
   { id: 'microsoft-teams', name: 'Microsoft Teams', icon: '👥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://teams.microsoft.com' },
   { id: 'slack', name: 'Slack', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'worker', url: 'https://slack.com' },
   { id: 'discord', name: 'Discord', icon: '🎮', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://discord.com' },
-  { id: 'telegram', name: 'Telegram', icon: '✈️', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://web.telegram.org' },
+  { id: 'telegram', name: 'Telegram', icon: '✈️', cat: CONNECTOR_CATS[5], kind: 'worker', url: 'https://web.telegram.org' },
   { id: 'skype', name: 'Skype', icon: '📞', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.skype.com' },
   { id: 'viber', name: 'Viber', icon: '📲', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.viber.com' },
   { id: 'wechat', name: 'WeChat', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.wechat.com' },
@@ -623,6 +624,10 @@ function connStatus(c, con) {
   if (c.kind === 'worker' && c.id === 'dropbox') {
     // Connected once the Dropbox module has loaded successfully at least once.
     return store.get('dropbox_ok', '') === '1' ? 'Connected' : 'Open';
+  }
+  if (c.kind === 'worker' && c.id === 'telegram') {
+    // Connected once the Telegram module has loaded successfully at least once.
+    return store.get('telegram_ok', '') === '1' ? 'Connected' : 'Open';
   }
   if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
@@ -1176,6 +1181,120 @@ async function loadDropboxLink(entry) {
   }
 }
 
+/* ---------- Telegram (free integration, via the Worker proxy) ----------
+   Telegram uses a bot token (BotFather in the user's Telegram app). The
+   app NEVER holds the token: the Worker keeps TELEGRAM_BOT_TOKEN as a
+   secret env var and calls https://api.telegram.org/bot<token>/<method>
+   server-side. Every Telegram call goes through the same Worker proxy as
+   GitHub, Notion, Slack and Dropbox, with { provider: 'telegram', path,
+   method, body }; path is the Bot API method name WITHOUT a leading
+   slash, e.g. 'getUpdates' or 'sendMessage'. getUpdates only returns
+   messages sent AFTER the bot was added / messaged — old history is
+   never visible to the bot. */
+async function telegramCall(path, method = 'GET', body = null) {
+  const res = await fetch(OAUTH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'telegram', path, method, body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || 'proxy_error');
+  return data;
+}
+function telegramChatTitle(chat) {
+  chat = chat || {};
+  if (chat.title) return chat.title;
+  const name = [chat.first_name || '', chat.last_name || ''].join(' ').trim();
+  return name || chat.username || 'Telegram chat';
+}
+function telegramSenderName(from) {
+  from = from || {};
+  const name = [from.first_name || '', from.last_name || ''].join(' ').trim();
+  return name || from.username || 'Telegram';
+}
+function telegramMsgTime(unix) {
+  try {
+    const d = new Date((unix || 0) * 1000);
+    if (isNaN(d.getTime()) || !unix) return '';
+    return d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+/* Group getUpdates results by chat: one entry per chat with its title and
+   latest message, newest chat first. */
+function groupTelegramChats(updates) {
+  const byId = {};
+  for (const u of updates || []) {
+    const m = u && u.message;
+    if (!m || !m.chat || m.chat.id === undefined || m.chat.id === null) continue;
+    const id = String(m.chat.id);
+    const prev = byId[id];
+    if (!prev || (m.date || 0) >= (prev.lastDate || 0)) {
+      byId[id] = { id, chat: m.chat, title: telegramChatTitle(m.chat), lastText: m.text || '', lastDate: m.date || 0 };
+    }
+  }
+  return Object.values(byId).sort((a, b) => (b.lastDate || 0) - (a.lastDate || 0));
+}
+/* All messages of one chat from cached updates, oldest first. */
+function telegramMessagesFor(updates, chatId) {
+  return (updates || [])
+    .map(u => u && u.message)
+    .filter(m => m && m.chat && String(m.chat.id) === String(chatId) && typeof m.text === 'string')
+    .map(m => ({ from: telegramSenderName(m.from), text: m.text, date: m.date || 0 }));
+}
+/* Load recent updates into state.telegram. Runs from afterRender when the
+   telegram module is open. Sets kira_telegram_ok = '1' on the first
+   successful load so the connector card can show Connected.
+   'not-configured' = the Worker has no Telegram bot token yet. A bot only
+   sees messages sent after it was messaged or added to a group, so an
+   empty result is explained in Bengali. Never shows raw API errors. */
+async function loadTelegram() {
+  const cur = state.telegram || {};
+  if (cur.status === 'loading') return;
+  const selected = cur.selected || null;
+  state.telegram = { status: 'loading', selected };
+  const show = () => { if (state.module === 'telegram') render(); };
+  try {
+    const data = await telegramCall('getUpdates', 'GET', { limit: 20 });
+    const updates = Array.isArray(data.result) ? data.result : [];
+    store.set('telegram_ok', '1');
+    const chats = groupTelegramChats(updates);
+    if (!chats.length) { state.telegram = { status: 'empty', selected: null, chats: [], updates: [] }; show(); return; }
+    const messages = selected ? telegramMessagesFor(updates, selected) : null;
+    state.telegram = { status: 'ready', chats, updates, selected, messages, msgsStatus: selected ? 'ready' : 'idle' };
+    show();
+  } catch (e) {
+    if (e && e.message === 'not_configured') state.telegram = { status: 'not-configured', selected };
+    else state.telegram = { status: 'error', selected };
+    show();
+  }
+}
+/* Show one chat's messages from the cached updates (no extra API call). */
+function selectTelegramChat(chatId) {
+  const cur = state.telegram || {};
+  const id = String(chatId || '').trim();
+  if (!id || !cur.chats) return;
+  const chat = cur.chats.find(c => String(c.id) === id);
+  if (!chat) return;
+  state.telegram = { ...cur, selected: id, messages: telegramMessagesFor(cur.updates || [], id), msgsStatus: 'ready' };
+  if (state.module === 'telegram') render();
+}
+/* Send the composer's text to the selected chat via sendMessage, then
+   reload updates so the sent message appears. */
+async function sendTelegramMessage() {
+  const input = typeof document !== 'undefined' ? document.querySelector('#telegramMsgInput') : null;
+  const text = (input && input.value || '').trim();
+  const cur = state.telegram || {};
+  if (!text || !cur.selected) return;
+  try {
+    await telegramCall('sendMessage', 'POST', { chat_id: cur.selected, text });
+    if (input) input.value = '';
+    state.telegram = { ...cur, status: 'idle' };
+    await loadTelegram();
+  } catch {
+    toast('মেসেজ পাঠানো যায়নি — আবার চেষ্টা করো।');
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
@@ -1190,7 +1309,9 @@ if (typeof window !== 'undefined') {
     exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub,
     notionCall, loadNotion, loadNotionPage, notionTitle, notionBlockText,
     slackCall, loadSlack, loadSlackHistory, sendSlackMessage,
-    dropboxCall, loadDropbox, loadDropboxLink, fmtDropboxSize };
+    dropboxCall, loadDropbox, loadDropboxLink, fmtDropboxSize,
+    telegramCall, loadTelegram, selectTelegramChat, sendTelegramMessage,
+    telegramChatTitle, telegramSenderName, telegramMsgTime };
 }
 
 /* ---------- shell & router ---------- */
@@ -1262,6 +1383,7 @@ function afterRender() {
   if (state.module === 'notion' && (state.notion || {}).status === 'idle') loadNotion();
   if (state.module === 'slack' && (state.slack || {}).status === 'idle') loadSlack();
   if (state.module === 'dropbox' && (state.dropbox || {}).status === 'idle') loadDropbox();
+  if (state.module === 'telegram' && (state.telegram || {}).status === 'idle') loadTelegram();
 }
 
 /* ---------- HOME ---------- */
@@ -1618,6 +1740,7 @@ const MORE_ITEMS = [
   { id: 'notion', icon: '📝', title: 'Notion' },
   { id: 'slack', icon: '💬', title: 'Slack' },
   { id: 'dropbox', icon: '📦', title: 'Dropbox' },
+  { id: 'telegram', icon: '✈️', title: 'Telegram' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -2185,6 +2308,46 @@ const MODULES = {
         ${linkCard}`;
       }
       return `<div class="card"><p class="muted">Dropbox লোড হচ্ছে…</p></div>`;
+    },
+  },
+  telegram: {
+    id: 'telegram', icon: '✈️', title: 'Telegram', hint: 'তোমার Telegram বটের মেসেজ — ফ্রি ইন্টিগ্রেশন। বটকে মেসেজ পাঠালেই বা গ্রুপে যোগ করলেই সেগুলো দেখা যাবে।',
+    render() {
+      const st = state.telegram || { status: 'idle' };
+      if (st.status === 'not-configured') {
+        return `<div class="card"><h3>Telegram এখনো সেটআপ হয়নি</h3>
+          <p class="muted">Telegram এখনো সেটআপ হয়নি — একটু পরে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="telegram-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'empty') {
+        return `<div class="card"><h3>এখনো কোনো মেসেজ নেই</h3>
+          <p class="muted">Telegram-এ বটকে এখনো কেউ মেসেজ পাঠায়নি — Telegram-এ গিয়ে বটকে মেসেজ পাঠাও, অথবা বটকে কোনো গ্রুপে যোগ করো, তারপর এখানে Refresh চাপো।</p>
+          <div class="btnrow"><button class="btn" data-act="telegram-refresh">↻ Refresh</button><button class="btn ghost" data-act="telegram-open-site">Open Telegram</button></div></div>`;
+      }
+      if (st.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Telegram ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="telegram-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'ready' && st.chats) {
+        const sel = st.chats.find(c => String(c.id) === String(st.selected));
+        const msgsCard = st.selected
+          ? st.msgsStatus === 'loading'
+            ? `<div class="card"><p class="muted">মেসেজ লোড হচ্ছে…</p></div>`
+            : st.msgsStatus === 'ready'
+              ? `<div class="card"><div class="btnrow"><button class="btn ghost small" data-act="telegram-back">← Back to chats</button></div>
+                  <h3 style="margin:8px 0">${esc(sel ? sel.title : '')}</h3>
+                  ${(st.messages || []).map(m => `<p style="margin:6px 0"><b>${esc(m.from || 'Telegram')}</b> <span class="muted">${esc(telegramMsgTime(m.date))}</span><br>${esc(m.text || '')}</p>`).join('') || emptyNote('এই চ্যাটে এখনো কোনো মেসেজ নেই।')}
+                  <div class="btnrow" style="margin-top:10px"><input id="telegramMsgInput" placeholder="মেসেজ লেখো…" style="flex:1"><button class="btn" data-act="telegram-send">Send</button></div></div>`
+              : `<div class="card"><p class="muted">মেসেজ আনা যায়নি — আবার চেষ্টা করো।</p><div class="btnrow"><button class="btn ghost small" data-act="telegram-back">← Back</button></div></div>`
+          : '';
+        return `<div class="card"><h3>Chats</h3>
+          ${st.chats.map(c => `<div class="list-item"><div><div class="t">${esc(c.title || '')}</div><div class="s">${esc(c.lastText || '')}</div></div>
+            <button class="btn small" data-act="telegram-chat" data-v="${esc(String(c.id || ''))}">${String(st.selected) === String(c.id) ? '✓ দেখছো' : 'Open'}</button></div>`).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="telegram-refresh">↻ Refresh</button></div></div>
+        ${msgsCard}`;
+      }
+      return `<div class="card"><p class="muted">Telegram লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -2939,10 +3102,11 @@ const ACTS = {
   'gh-refresh'() { state.github = { status: 'idle' }; render(); },
   'github-signin'() { startGitHubSignIn(); },
   'conn-worker'(el) {
-    // Worker-backed connectors (Notion, Slack, Dropbox): Open shows the in-app module.
+    // Worker-backed connectors (Notion, Slack, Dropbox, Telegram): Open shows the in-app module.
     if (el.dataset.v === 'notion') openModule('notion');
     if (el.dataset.v === 'slack') openModule('slack');
     if (el.dataset.v === 'dropbox') openModule('dropbox');
+    if (el.dataset.v === 'telegram') openModule('telegram');
   },
   'notion-refresh'() { state.notion = { status: 'idle' }; render(); },
   'notion-open-site'() { openConnUrl('https://www.notion.so'); },
@@ -2996,6 +3160,18 @@ const ACTS = {
     const u = (el.dataset.v || '').trim();
     if (u) openConnUrl(u);
   },
+  'telegram-refresh'() { state.telegram = { status: 'idle' }; render(); },
+  'telegram-open-site'() { openConnUrl('https://web.telegram.org'); },
+  'telegram-chat'(el) {
+    const id = (el.dataset.v || '').trim();
+    if (!id) return;
+    selectTelegramChat(id);
+  },
+  'telegram-back'() {
+    state.telegram = { ...state.telegram, selected: null, messages: null, msgsStatus: 'idle' };
+    render();
+  },
+  'telegram-send'() { sendTelegramMessage(); },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
