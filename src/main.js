@@ -414,6 +414,7 @@ const state = {
   searchconsole: { status: 'idle' }, // Search Console sites + rows cache: idle|loading|ready|need-scope|no-sites|error
   notion: { status: 'idle' }, // Notion shared pages cache: idle|loading|ready|empty|not-configured|error
   slack: { status: 'idle' }, // Slack channels cache: idle|loading|ready|empty|not-configured|error
+  dropbox: { status: 'idle', path: '' }, // Dropbox folder cache: idle|loading|ready|empty|not-configured|error; path '' = root
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -456,7 +457,7 @@ const SOCIALS = [
 /* ---------- Connectors directory (100 services, 10 categories) ----------
    kind: 'google' = real Google OAuth (reuses the existing sign-in flow);
    'oauth' = real OAuth via the Worker proxy (GitHub — see GITHUB_* above);
-   'worker' = Worker-backed integration (Notion, Slack — the token lives in the
+   'worker' = Worker-backed integration (Notion, Slack, Dropbox — the token lives in the
    Worker, the app never sees it); 'key' = API key saved on this device
    only; 'link' = opens the official site.
    Connection state lives in localStorage under kira_connectors_v1 as
@@ -543,7 +544,7 @@ const CONNECTORS = [
   { id: 'wechat', name: 'WeChat', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.wechat.com' },
   { id: 'google-voice', name: 'Google Voice', icon: '☎️', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://voice.google.com' },
   // 7. File, Storage ও Document
-  { id: 'dropbox', name: 'Dropbox', icon: '📦', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.dropbox.com' },
+  { id: 'dropbox', name: 'Dropbox', icon: '📦', cat: CONNECTOR_CATS[6], kind: 'worker', url: 'https://www.dropbox.com' },
   { id: 'onedrive', name: 'OneDrive', icon: '☁️', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://onedrive.live.com' },
   { id: 'box', name: 'Box', icon: '📁', cat: CONNECTOR_CATS[6], kind: 'link', url: 'https://www.box.com' },
   { id: 'notion', name: 'Notion', icon: '📝', cat: CONNECTOR_CATS[6], kind: 'worker', url: 'https://www.notion.so' },
@@ -618,6 +619,10 @@ function connStatus(c, con) {
   if (c.kind === 'worker' && c.id === 'slack') {
     // Connected once the Slack module has loaded successfully at least once.
     return store.get('slack_ok', '') === '1' ? 'Connected' : 'Open';
+  }
+  if (c.kind === 'worker' && c.id === 'dropbox') {
+    // Connected once the Dropbox module has loaded successfully at least once.
+    return store.get('dropbox_ok', '') === '1' ? 'Connected' : 'Open';
   }
   if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
@@ -1100,6 +1105,77 @@ async function sendSlackMessage() {
   }
 }
 
+/* ---------- Dropbox (free integration, via the Worker proxy) ----------
+   Dropbox auth is OAuth with a refresh token. The app NEVER holds any
+   token: the Worker keeps DROPBOX_CLIENT_ID, DROPBOX_CLIENT_SECRET and
+   DROPBOX_REFRESH_TOKEN as secret env vars, exchanges the refresh token
+   for a short-lived access token server-side, and calls the Dropbox API
+   with it. Every Dropbox call goes through the same Worker proxy as
+   GitHub, Notion and Slack, with { provider: 'dropbox', path, method,
+   body }; path is the full Dropbox API path, e.g. /2/files/list_folder.
+   The Dropbox app needs scoped access with files.content.read. */
+async function dropboxCall(path, method = 'POST', body = null) {
+  const res = await fetch(OAUTH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'dropbox', path, method, body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || 'proxy_error');
+  return data;
+}
+function fmtDropboxSize(n) {
+  if (typeof n !== 'number' || isNaN(n)) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(1) + ' GB';
+}
+/* Load one folder's entries into state.dropbox. Runs from afterRender
+   when the dropbox module is open. Sets kira_dropbox_ok = '1' on the
+   first successful list so the connector card can show Connected.
+   'not-configured' = the Worker has no Dropbox credentials yet. Folders
+   sort first, then files, each by name. Never shows raw API errors. */
+async function loadDropbox() {
+  const cur = state.dropbox || {};
+  const path = cur.path || '';
+  if (cur.status === 'loading') return;
+  state.dropbox = { status: 'loading', path };
+  const show = () => { if (state.module === 'dropbox') render(); };
+  try {
+    const data = await dropboxCall('/2/files/list_folder', 'POST', { path });
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    entries.sort((a, b) => {
+      const at = a['.tag'] === 'folder' ? 0 : 1, bt = b['.tag'] === 'folder' ? 0 : 1;
+      return at - bt || String(a.name || '').localeCompare(String(b.name || ''));
+    });
+    store.set('dropbox_ok', '1');
+    if (!entries.length) { state.dropbox = { status: 'empty', path }; show(); return; }
+    state.dropbox = { status: 'ready', path, entries, link: null, linkName: null, linkStatus: 'idle' };
+    show();
+  } catch (e) {
+    if (e && e.message === 'not_configured') state.dropbox = { status: 'not-configured', path };
+    else state.dropbox = { status: 'error', path };
+    show();
+  }
+}
+/* Get a temporary download link for one file and show it in the module. */
+async function loadDropboxLink(entry) {
+  const cur = state.dropbox || {};
+  if (!entry || cur.linkStatus === 'loading') return;
+  state.dropbox = { ...cur, link: null, linkName: entry.name || '', linkStatus: 'loading' };
+  const show = () => { if (state.module === 'dropbox') render(); };
+  show();
+  try {
+    const data = await dropboxCall('/2/files/get_temporary_link', 'POST', { path: entry.path_lower || entry.path_display || '' });
+    state.dropbox = { ...state.dropbox, link: data.link || '', linkName: entry.name || '', linkStatus: 'ready' };
+    show();
+  } catch {
+    state.dropbox = { ...state.dropbox, linkStatus: 'error' };
+    show();
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
@@ -1113,7 +1189,8 @@ if (typeof window !== 'undefined') {
     OAUTH_PROXY_URL, GITHUB_API, buildGitHubAuthUrl, startGitHubSignIn,
     exchangeGitHubCode, githubSignOut, isGitHubSignedIn, githubTokens, loadGitHub,
     notionCall, loadNotion, loadNotionPage, notionTitle, notionBlockText,
-    slackCall, loadSlack, loadSlackHistory, sendSlackMessage };
+    slackCall, loadSlack, loadSlackHistory, sendSlackMessage,
+    dropboxCall, loadDropbox, loadDropboxLink, fmtDropboxSize };
 }
 
 /* ---------- shell & router ---------- */
@@ -1184,6 +1261,7 @@ function afterRender() {
   if (state.module === 'searchconsole' && isGoogleSignedIn() && (state.searchconsole || {}).status === 'idle') loadSearchConsole();
   if (state.module === 'notion' && (state.notion || {}).status === 'idle') loadNotion();
   if (state.module === 'slack' && (state.slack || {}).status === 'idle') loadSlack();
+  if (state.module === 'dropbox' && (state.dropbox || {}).status === 'idle') loadDropbox();
 }
 
 /* ---------- HOME ---------- */
@@ -1539,6 +1617,7 @@ const MORE_ITEMS = [
   { id: 'searchconsole', icon: '🔍', title: 'Search Console' },
   { id: 'notion', icon: '📝', title: 'Notion' },
   { id: 'slack', icon: '💬', title: 'Slack' },
+  { id: 'dropbox', icon: '📦', title: 'Dropbox' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -2059,6 +2138,53 @@ const MODULES = {
         ${msgsCard}`;
       }
       return `<div class="card"><p class="muted">Slack লোড হচ্ছে…</p></div>`;
+    },
+  },
+  dropbox: {
+    id: 'dropbox', icon: '📦', title: 'Dropbox', hint: 'তোমার Dropbox ফাইল আর ফোল্ডার — ফ্রি ইন্টিগ্রেশন। ফাইলে ট্যাপ করলেই ডাউনলোড লিংক পাবে।',
+    render() {
+      const st = state.dropbox || { status: 'idle', path: '' };
+      const curPath = st.path || '';
+      const crumbs = curPath ? 'Dropbox / ' + curPath.split('/').filter(Boolean).join(' / ') : 'Dropbox / Home';
+      const backBtn = curPath
+        ? `<div class="btnrow"><button class="btn ghost small" data-act="dropbox-back">← Back</button></div>` : '';
+      if (st.status === 'not-configured') {
+        return `<div class="card"><h3>Dropbox এখনো সেটআপ হয়নি</h3>
+          <p class="muted">Dropbox এখনো সেটআপ হয়নি — একটু পরে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="dropbox-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'empty') {
+        return `<div class="card"><h3>${esc(crumbs)}</h3>
+          <p class="muted">এই ফোল্ডার খালি।</p>
+          ${backBtn}<div class="btnrow"><button class="btn" data-act="dropbox-refresh">↻ Refresh</button><button class="btn ghost" data-act="dropbox-open-site">Open Dropbox</button></div></div>`;
+      }
+      if (st.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Dropbox ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="dropbox-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'ready' && st.entries) {
+        const linkCard = st.linkStatus === 'loading'
+          ? `<div class="card"><p class="muted">লিংক তৈরি হচ্ছে…</p></div>`
+          : st.linkStatus === 'ready' && st.link
+            ? `<div class="card"><h3>📄 ${esc(st.linkName || 'File')}</h3>
+                <p class="muted" style="word-break:break-all">${esc(st.link)}</p>
+                <div class="btnrow"><button class="btn" data-act="dropbox-open-link" data-v="${esc(st.link)}">Open / Download</button></div></div>`
+            : st.linkStatus === 'error'
+              ? `<div class="card"><p class="muted">লিংক তৈরি হয়নি — আবার চেষ্টা করো।</p></div>`
+              : '';
+        return `<div class="card"><h3>${esc(crumbs)}</h3>
+          ${backBtn}
+          ${st.entries.map(e => {
+            const isFolder = e['.tag'] === 'folder';
+            const sub = isFolder ? 'Folder' : [fmtDropboxSize(e.size), e.client_modified ? fmtNotionDate(e.client_modified) : ''].filter(Boolean).join(' · ');
+            return `<div class="list-item"><div><div class="t">${isFolder ? '📁' : '📄'} ${esc(e.name || '')}</div><div class="s">${esc(sub)}</div></div>
+            <button class="btn small" data-act="${isFolder ? 'dropbox-folder' : 'dropbox-file'}" data-v="${esc(e.path_lower || e.path_display || '')}">${isFolder ? 'Open' : 'Get link'}</button></div>`;
+          }).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="dropbox-refresh">↻ Refresh</button></div></div>
+        ${linkCard}`;
+      }
+      return `<div class="card"><p class="muted">Dropbox লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -2813,9 +2939,10 @@ const ACTS = {
   'gh-refresh'() { state.github = { status: 'idle' }; render(); },
   'github-signin'() { startGitHubSignIn(); },
   'conn-worker'(el) {
-    // Worker-backed connectors (Notion, Slack): Open shows the in-app module.
+    // Worker-backed connectors (Notion, Slack, Dropbox): Open shows the in-app module.
     if (el.dataset.v === 'notion') openModule('notion');
     if (el.dataset.v === 'slack') openModule('slack');
+    if (el.dataset.v === 'dropbox') openModule('dropbox');
   },
   'notion-refresh'() { state.notion = { status: 'idle' }; render(); },
   'notion-open-site'() { openConnUrl('https://www.notion.so'); },
@@ -2844,6 +2971,31 @@ const ACTS = {
     render();
   },
   'slack-send'() { sendSlackMessage(); },
+  'dropbox-refresh'() { state.dropbox = { status: 'idle', path: (state.dropbox || {}).path || '' }; render(); },
+  'dropbox-open-site'() { openConnUrl('https://www.dropbox.com'); },
+  'dropbox-folder'(el) {
+    const p = (el.dataset.v || '').trim();
+    if (!p) return;
+    state.dropbox = { status: 'idle', path: p };
+    render();
+  },
+  'dropbox-back'() {
+    const cur = (state.dropbox || {}).path || '';
+    const parts = cur.split('/').filter(Boolean);
+    parts.pop();
+    state.dropbox = { status: 'idle', path: parts.length ? '/' + parts.join('/') : '' };
+    render();
+  },
+  'dropbox-file'(el) {
+    const p = (el.dataset.v || '').trim();
+    if (!p) return;
+    const entry = ((state.dropbox || {}).entries || []).find(e => (e.path_lower || e.path_display || '') === p);
+    if (entry) loadDropboxLink(entry);
+  },
+  'dropbox-open-link'(el) {
+    const u = (el.dataset.v || '').trim();
+    if (u) openConnUrl(u);
+  },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
