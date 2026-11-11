@@ -13,6 +13,7 @@
   .btn:disabled { background: #999; }
   .note { background: #f2f6ff; border: 1px solid #cfe0ff; border-radius: 8px; padding: 12px; margin-top: 16px; }
   .val { background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-top: 12px; word-break: break-all; font-size: 18px; }
+  .valinput { width: 100%; padding: 10px; font-size: 15px; margin-top: 4px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
   .val b { display: block; font-size: 14px; color: #333; margin-bottom: 4px; }
   .copy { margin-top: 6px; padding: 8px 14px; font-size: 15px; background: #0a7d2c; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
   small { color: #555; }
@@ -23,9 +24,9 @@
 <div id="showMode" style="display:none">
   <h1>Dropbox সিক্রেট — কপি করে নাও</h1>
   <p>নিচের ৩টা ভ্যালু Cloudflare-এ kira-oauth → Settings → Variables → Add Secret-এ বসাতে হবে।</p>
-  <div class="val"><b>DROPBOX_CLIENT_ID</b><span id="v1"></span><br><button class="copy" data-t="v1">Copy</button></div>
-  <div class="val"><b>DROPBOX_CLIENT_SECRET</b><span id="v2"></span><br><button class="copy" data-t="v2">Copy</button></div>
-  <div class="val"><b>DROPBOX_REFRESH_TOKEN</b><span id="v3"></span><br><button class="copy" data-t="v3">Copy</button></div>
+  <div class="val"><b>DROPBOX_CLIENT_ID</b><input class="valinput" id="v1" readonly onclick="this.select()" value=""><br><button class="copy" data-t="v1">Copy</button></div>
+  <div class="val"><b>DROPBOX_CLIENT_SECRET</b><input class="valinput" id="v2" readonly onclick="this.select()" value=""><br><button class="copy" data-t="v2">Copy</button></div>
+  <div class="val"><b>DROPBOX_REFRESH_TOKEN</b><input class="valinput" id="v3" readonly onclick="this.select()" value=""><br><button class="copy" data-t="v3">Copy</button></div>
 </div>
 
 <div id="formMode">
@@ -66,15 +67,16 @@
     if (a && b && c) {
       document.getElementById('formMode').style.display = 'none';
       document.getElementById('showMode').style.display = 'block';
-      document.getElementById('v1').textContent = a;
-      document.getElementById('v2').textContent = b;
-      document.getElementById('v3').textContent = c;
+      document.getElementById('v1').value = a;
+      document.getElementById('v2').value = b;
+      document.getElementById('v3').value = c;
       document.title = 'Dropbox সিক্রেট';
     }
   }
   document.querySelectorAll('.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
-      var t = document.getElementById(btn.getAttribute('data-t')).textContent;
+      var el = document.getElementById(btn.getAttribute('data-t'));
+      var t = (el.value !== undefined) ? el.value : el.textContent;
       if (navigator.clipboard) { navigator.clipboard.writeText(t); }
       btn.textContent = 'Copied ✓';
       setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
