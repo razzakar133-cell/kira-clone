@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dropbox Refresh Token</title>
+<style>
+  body { font-family: sans-serif; max-width: 600px; margin: 24px auto; padding: 0 16px; line-height: 1.6; }
+  h1 { font-size: 20px; }
+  label { display: block; margin-top: 16px; font-weight: bold; }
+  input { width: 100%; padding: 10px; font-size: 16px; margin-top: 4px; box-sizing: border-box; }
+  .btn { display: inline-block; margin-top: 18px; padding: 12px 20px; font-size: 17px; background: #0061ff; color: #fff; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; }
+  .btn:disabled { background: #999; }
+  .note { background: #f2f6ff; border: 1px solid #cfe0ff; border-radius: 8px; padding: 12px; margin-top: 16px; }
+  .val { background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-top: 12px; word-break: break-all; font-size: 18px; }
+  .val b { display: block; font-size: 14px; color: #333; margin-bottom: 4px; }
+  .copy { margin-top: 6px; padding: 8px 14px; font-size: 15px; background: #0a7d2c; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+  small { color: #555; }
+</style>
+</head>
+<body>
+
+<div id="showMode" style="display:none">
+  <h1>Dropbox সিক্রেট — কপি করে নাও</h1>
+  <p>নিচের ৩টা ভ্যালু Cloudflare-এ kira-oauth → Settings → Variables → Add Secret-এ বসাতে হবে।</p>
+  <div class="val"><b>DROPBOX_CLIENT_ID</b><span id="v1"></span><br><button class="copy" data-t="v1">Copy</button></div>
+  <div class="val"><b>DROPBOX_CLIENT_SECRET</b><span id="v2"></span><br><button class="copy" data-t="v2">Copy</button></div>
+  <div class="val"><b>DROPBOX_REFRESH_TOKEN</b><span id="v3"></span><br><button class="copy" data-t="v3">Copy</button></div>
+</div>
+
+<div id="formMode">
+<h1>Dropbox Refresh Token নেওয়ার পাতা</h1>
+
+<div class="note">
+<b>ধাপ ১:</b> Dropbox অ্যাপের <b>App key</b> নিচে বসাও। তারপর <b>Authorize</b> বোতামে চাপ দাও — নতুন ট্যাবে Dropbox খুলবে, <b>Allow</b> চাপো। যে পাতায় কোড দেখাবে, কোডটা কপি করে নিচের <b>Code</b> ঘরে বসাও।
+</div>
+
+<label>App key</label>
+<input id="key" type="text" placeholder="Dropbox App key" autocomplete="off">
+<br>
+<a id="authLink" class="btn" href="#" target="_blank">Authorize (Allow চাপতে হবে)</a>
+
+<div class="note">
+<b>ধাপ ২:</b> Code আর <b>App secret</b> বসিয়ে <b>Refresh token নাও</b> চাপো। পরের পাতায় JSON লেখা আসবে — তার ভেতরে <b>"refresh_token"</b>-এর পাশের লম্বা লেখাটাই তোমার refresh token, কপি করে নিও।
+</div>
+
+<form id="tokenForm" method="POST" action="https://api.dropboxapi.com/oauth2/token">
+  <input type="hidden" name="grant_type" value="authorization_code">
+  <input type="hidden" name="redirect_uri" value="https://razzakar133-cell.github.io/kira-clone/oauth.html">
+  <label>Code</label>
+  <input id="code" name="code" type="text" placeholder="Authorize-এর পর পাওয়া code" autocomplete="off">
+  <label>App secret</label>
+  <input id="secret" name="client_secret" type="text" placeholder="Dropbox App secret" autocomplete="off">
+  <input id="cid" name="client_id" type="hidden">
+  <br>
+  <button class="btn" type="submit">Refresh token নাও</button>
+</form>
+</div>
+
+<script>
+  // Show mode: #client_id=...&client_secret=...&refresh_token=...
+  var hash = location.hash.slice(1);
+  if (hash.indexOf('client_id=') !== -1) {
+    var p = new URLSearchParams(hash);
+    var a = p.get('client_id') || '', b = p.get('client_secret') || '', c = p.get('refresh_token') || '';
+    if (a && b && c) {
+      document.getElementById('formMode').style.display = 'none';
+      document.getElementById('showMode').style.display = 'block';
+      document.getElementById('v1').textContent = a;
+      document.getElementById('v2').textContent = b;
+      document.getElementById('v3').textContent = c;
+      document.title = 'Dropbox সিক্রেট';
+    }
+  }
+  document.querySelectorAll('.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var t = document.getElementById(btn.getAttribute('data-t')).textContent;
+      if (navigator.clipboard) { navigator.clipboard.writeText(t); }
+      btn.textContent = 'Copied ✓';
+      setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+    });
+  });
+  var keyInput = document.getElementById('key');
+  var authLink = document.getElementById('authLink');
+  var cid = document.getElementById('cid');
+  function update() {
+    var k = keyInput.value.trim();
+    cid.value = k;
+    if (k) {
+      authLink.href = 'https://www.dropbox.com/oauth2/authorize?client_id=' + encodeURIComponent(k) + '&response_type=code&redirect_uri=' + encodeURIComponent('https://razzakar133-cell.github.io/kira-clone/oauth.html') + '&token_access_type=offline';
+      authLink.style.background = '#0061ff';
+    } else {
+      authLink.href = '#';
+      authLink.style.background = '#999';
+    }
+  }
+  keyInput.addEventListener('input', update);
+  update();
+</script>
+</body>
+</html>
