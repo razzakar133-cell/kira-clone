@@ -416,6 +416,7 @@ const state = {
   slack: { status: 'idle' }, // Slack channels cache: idle|loading|ready|empty|not-configured|error
   dropbox: { status: 'idle', path: '' }, // Dropbox folder cache: idle|loading|ready|empty|not-configured|error; path '' = root
   telegram: { status: 'idle' }, // Telegram chats cache: idle|loading|ready|empty|not-configured|error
+  discord: { status: 'idle' }, // Discord servers cache: idle|loading|ready|empty|not-configured|error
 };
 function saveChat() { save('kira_chat_v1', state.chatHist.slice(-30)); }
 function saveStats() { store.set('stats', state.stats); }
@@ -458,7 +459,7 @@ const SOCIALS = [
 /* ---------- Connectors directory (100 services, 10 categories) ----------
    kind: 'google' = real Google OAuth (reuses the existing sign-in flow);
    'oauth' = real OAuth via the Worker proxy (GitHub — see GITHUB_* above);
-   'worker' = Worker-backed integration (Notion, Slack, Dropbox — the token lives in the
+   'worker' = Worker-backed integration (Notion, Slack, Dropbox, Telegram, Discord — the token lives in the
    Worker, the app never sees it); 'key' = API key saved on this device
    only; 'link' = opens the official site.
    Connection state lives in localStorage under kira_connectors_v1 as
@@ -538,7 +539,7 @@ const CONNECTORS = [
   { id: 'google-meet', name: 'Google Meet', icon: '🎥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://meet.google.com' },
   { id: 'microsoft-teams', name: 'Microsoft Teams', icon: '👥', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://teams.microsoft.com' },
   { id: 'slack', name: 'Slack', icon: '💬', cat: CONNECTOR_CATS[5], kind: 'worker', url: 'https://slack.com' },
-  { id: 'discord', name: 'Discord', icon: '🎮', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://discord.com' },
+  { id: 'discord', name: 'Discord', icon: '🎮', cat: CONNECTOR_CATS[5], kind: 'worker', url: 'https://discord.com' },
   { id: 'telegram', name: 'Telegram', icon: '✈️', cat: CONNECTOR_CATS[5], kind: 'worker', url: 'https://web.telegram.org' },
   { id: 'skype', name: 'Skype', icon: '📞', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.skype.com' },
   { id: 'viber', name: 'Viber', icon: '📲', cat: CONNECTOR_CATS[5], kind: 'link', url: 'https://www.viber.com' },
@@ -628,6 +629,10 @@ function connStatus(c, con) {
   if (c.kind === 'worker' && c.id === 'telegram') {
     // Connected once the Telegram module has loaded successfully at least once.
     return store.get('telegram_ok', '') === '1' ? 'Connected' : 'Open';
+  }
+  if (c.kind === 'worker' && c.id === 'discord') {
+    // Connected once the Discord module has loaded successfully at least once.
+    return store.get('discord_ok', '') === '1' ? 'Connected' : 'Open';
   }
   if (c.kind === 'key') {
     const k = store.get('key_' + c.id, '');
@@ -1295,6 +1300,115 @@ async function sendTelegramMessage() {
   }
 }
 
+/* ---------- Discord (free integration, via the Worker proxy) ----------
+   Discord uses a bot token (Discord Developer Portal → Applications →
+   Bot → Reset Token). The app NEVER holds the token: the Worker keeps
+   DISCORD_BOT_TOKEN as a secret env var and calls
+   https://discord.com/api/v10 + path with `Authorization: Bot <token>`
+   server-side. Every Discord call goes through the same Worker proxy as
+   GitHub, Notion, Slack, Dropbox and Telegram, with
+   { provider: 'discord', path, method, body }; path is the Discord API
+   path WITH a leading slash, e.g. /users/@me/guilds. A bot only sees
+   servers it was invited to (Developer Portal → OAuth2 → URL Generator
+   → scope bot → invite link) and only text channels it can view. */
+async function discordCall(path, method = 'GET', body = null) {
+  const res = await fetch(OAUTH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'discord', path, method, body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || 'proxy_error');
+  return data;
+}
+function discordMsgTime(ts) {
+  try {
+    const d = new Date(ts || '');
+    if (isNaN(d.getTime()) || !ts) return '';
+    return d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+function discordAuthorName(author) {
+  author = author || {};
+  return author.global_name || author.username || 'Discord';
+}
+/* Load the servers the bot is in into state.discord. Runs from
+   afterRender when the discord module is open. Sets kira_discord_ok =
+   '1' on the first successful load so the connector card can show
+   Connected. 'not-configured' = the Worker has no Discord bot token
+   yet. Never shows raw API errors to the user. */
+async function loadDiscord() {
+  const cur = state.discord || {};
+  if (cur.status === 'loading') return;
+  state.discord = { status: 'loading' };
+  const show = () => { if (state.module === 'discord') render(); };
+  try {
+    const data = await discordCall('/users/@me/guilds', 'GET', { with_counts: true, limit: 100 });
+    const guilds = Array.isArray(data) ? data : [];
+    store.set('discord_ok', '1');
+    if (!guilds.length) { state.discord = { status: 'empty' }; show(); return; }
+    state.discord = { status: 'ready', guilds, selectedGuild: null, channels: null, channelsStatus: 'idle', selectedChannel: null, messages: null, msgsStatus: 'idle' };
+    show();
+  } catch (e) {
+    if (e && e.message === 'not_configured') state.discord = { status: 'not-configured' };
+    else state.discord = { status: 'error' };
+    show();
+  }
+}
+/* Load one server's text channels (type 0 only), sorted by position. */
+async function loadDiscordChannels(guildId) {
+  const cur = state.discord || {};
+  const id = String(guildId || '').trim();
+  if (!id || cur.channelsStatus === 'loading') return;
+  state.discord = { ...cur, selectedGuild: id, channels: null, channelsStatus: 'loading', selectedChannel: null, messages: null, msgsStatus: 'idle' };
+  const show = () => { if (state.module === 'discord') render(); };
+  show();
+  try {
+    const data = await discordCall('/guilds/' + id + '/channels', 'GET', {});
+    const channels = (Array.isArray(data) ? data : [])
+      .filter(c => c && c.type === 0)
+      .sort((a, b) => (a.position || 0) - (b.position || 0));
+    state.discord = { ...state.discord, channels, channelsStatus: 'ready' };
+    show();
+  } catch {
+    state.discord = { ...state.discord, channelsStatus: 'error' };
+    show();
+  }
+}
+/* Load the last 20 messages of one channel (Discord returns newest
+   first; the module displays them in that order). */
+async function loadDiscordMessages(channelId) {
+  const cur = state.discord || {};
+  const id = String(channelId || '').trim();
+  if (!id || cur.msgsStatus === 'loading') return;
+  state.discord = { ...cur, selectedChannel: id, messages: null, msgsStatus: 'loading' };
+  const show = () => { if (state.module === 'discord') render(); };
+  show();
+  try {
+    const data = await discordCall('/channels/' + id + '/messages', 'GET', { limit: 20 });
+    const messages = Array.isArray(data) ? data : [];
+    state.discord = { ...state.discord, messages, msgsStatus: 'ready' };
+    show();
+  } catch {
+    state.discord = { ...state.discord, msgsStatus: 'error' };
+    show();
+  }
+}
+/* Post the composer's text to the selected channel, then reload messages. */
+async function sendDiscordMessage() {
+  const input = typeof document !== 'undefined' ? document.querySelector('#discordMsgInput') : null;
+  const text = (input && input.value || '').trim();
+  const cur = state.discord || {};
+  if (!text || !cur.selectedChannel) return;
+  try {
+    await discordCall('/channels/' + cur.selectedChannel + '/messages', 'POST', { content: text });
+    if (input) input.value = '';
+    await loadDiscordMessages(cur.selectedChannel);
+  } catch {
+    toast('মেসেজ পাঠানো যায়নি — আবার চেষ্টা করো।');
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.__kira = { state, MODELS, store, callGemini, templateReply,
     CONNECTORS, CONNECTOR_CATS, maskKey, connStatus,
@@ -1311,7 +1425,9 @@ if (typeof window !== 'undefined') {
     slackCall, loadSlack, loadSlackHistory, sendSlackMessage,
     dropboxCall, loadDropbox, loadDropboxLink, fmtDropboxSize,
     telegramCall, loadTelegram, selectTelegramChat, sendTelegramMessage,
-    telegramChatTitle, telegramSenderName, telegramMsgTime };
+    telegramChatTitle, telegramSenderName, telegramMsgTime,
+    discordCall, loadDiscord, loadDiscordChannels, loadDiscordMessages, sendDiscordMessage,
+    discordMsgTime, discordAuthorName };
 }
 
 /* ---------- shell & router ---------- */
@@ -1384,6 +1500,7 @@ function afterRender() {
   if (state.module === 'slack' && (state.slack || {}).status === 'idle') loadSlack();
   if (state.module === 'dropbox' && (state.dropbox || {}).status === 'idle') loadDropbox();
   if (state.module === 'telegram' && (state.telegram || {}).status === 'idle') loadTelegram();
+  if (state.module === 'discord' && (state.discord || {}).status === 'idle') loadDiscord();
 }
 
 /* ---------- HOME ---------- */
@@ -1741,6 +1858,7 @@ const MORE_ITEMS = [
   { id: 'slack', icon: '💬', title: 'Slack' },
   { id: 'dropbox', icon: '📦', title: 'Dropbox' },
   { id: 'telegram', icon: '✈️', title: 'Telegram' },
+  { id: 'discord', icon: '🎮', title: 'Discord' },
   { id: 'meetings', icon: '📹', title: 'Meetings' },
   { id: 'vision-board', icon: '👁️', title: 'Vision Board' },
   { id: 'locked-pro', icon: '🔒', title: 'Unlocks after the first task', locked: true },
@@ -2348,6 +2466,58 @@ const MODULES = {
         ${msgsCard}`;
       }
       return `<div class="card"><p class="muted">Telegram লোড হচ্ছে…</p></div>`;
+    },
+  },
+  discord: {
+    id: 'discord', icon: '🎮', title: 'Discord', hint: 'তোমার Discord সার্ভার আর মেসেজ — ফ্রি ইন্টিগ্রেশন। বটকে সার্ভারে Invite করলেই সেগুলো দেখা যাবে।',
+    render() {
+      const st = state.discord || { status: 'idle' };
+      if (st.status === 'not-configured') {
+        return `<div class="card"><h3>Discord এখনো সেটআপ হয়নি</h3>
+          <p class="muted">Discord এখনো সেটআপ হয়নি — একটু পরে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="discord-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'empty') {
+        return `<div class="card"><h3>কোনো সার্ভার দেখা যাচ্ছে না</h3>
+          <p class="muted">Discord-এ বট কোনো সার্ভারে নেই — Discord Developer Portal-এ গিয়ে বটকে সার্ভারে Invite করো (OAuth2 → URL Generator → bot scope), তারপর এখানে Refresh চাপো।</p>
+          <div class="btnrow"><button class="btn" data-act="discord-refresh">↻ Refresh</button><button class="btn ghost" data-act="discord-open-site">Open Discord</button></div></div>`;
+      }
+      if (st.status === 'error') {
+        return `<div class="card"><h3>লোড হয়নি</h3>
+          <p class="muted">Discord ডেটা আনা যায়নি — নেট চেক করে আবার চেষ্টা করো।</p>
+          <div class="btnrow"><button class="btn" data-act="discord-refresh">↻ আবার চেষ্টা করো</button></div></div>`;
+      }
+      if (st.status === 'ready' && st.guilds) {
+        const selGuild = st.guilds.find(g => String(g.id) === String(st.selectedGuild));
+        const channelsCard = st.selectedGuild
+          ? st.channelsStatus === 'loading'
+            ? `<div class="card"><p class="muted">চ্যানেল লোড হচ্ছে…</p></div>`
+            : st.channelsStatus === 'ready'
+              ? `<div class="card"><div class="btnrow"><button class="btn ghost small" data-act="discord-back-guild">← Back to servers</button></div>
+                  <h3 style="margin:8px 0">${esc(selGuild ? selGuild.name : '')}</h3>
+                  ${(st.channels || []).map(c => `<div class="list-item"><div><div class="t">#${esc(c.name || '')}</div><div class="s">Text channel</div></div>
+                    <button class="btn small" data-act="discord-channel" data-v="${esc(String(c.id || ''))}">${String(st.selectedChannel) === String(c.id) ? '✓ দেখছো' : 'Open'}</button></div>`).join('') || emptyNote('এই সার্ভারে কোনো টেক্সট চ্যানেল নেই।')}</div>`
+              : `<div class="card"><p class="muted">চ্যানেল আনা যায়নি — আবার চেষ্টা করো।</p><div class="btnrow"><button class="btn ghost small" data-act="discord-back-guild">← Back</button></div></div>`
+          : '';
+        const selChannel = (st.channels || []).find(c => String(c.id) === String(st.selectedChannel));
+        const msgsCard = st.selectedChannel
+          ? st.msgsStatus === 'loading'
+            ? `<div class="card"><p class="muted">মেসেজ লোড হচ্ছে…</p></div>`
+            : st.msgsStatus === 'ready'
+              ? `<div class="card"><div class="btnrow"><button class="btn ghost small" data-act="discord-back-channel">← Back to channels</button></div>
+                  <h3 style="margin:8px 0">#${esc(selChannel ? selChannel.name : '')}</h3>
+                  ${(st.messages || []).map(m => `<p style="margin:6px 0"><b>${esc(discordAuthorName(m.author))}</b> <span class="muted">${esc(discordMsgTime(m.timestamp))}</span><br>${esc(m.content || '')}</p>`).join('') || emptyNote('এই চ্যানেলে এখনো কোনো মেসেজ নেই।')}
+                  <div class="btnrow" style="margin-top:10px"><input id="discordMsgInput" placeholder="মেসেজ লেখো…" style="flex:1"><button class="btn" data-act="discord-send">Send</button></div></div>`
+              : `<div class="card"><p class="muted">মেসেজ আনা যায়নি — আবার চেষ্টা করো।</p><div class="btnrow"><button class="btn ghost small" data-act="discord-back-channel">← Back</button></div></div>`
+          : '';
+        return `<div class="card"><h3>Servers</h3>
+          ${st.guilds.map(g => `<div class="list-item"><div><div class="t">${esc(g.name || '')}</div><div class="s">${typeof g.approximate_member_count === 'number' ? g.approximate_member_count + ' জন সদস্য' : 'Server'}</div></div>
+            <button class="btn small" data-act="discord-guild" data-v="${esc(String(g.id || ''))}">${String(st.selectedGuild) === String(g.id) ? '✓ দেখছো' : 'Open'}</button></div>`).join('')}
+          <div class="btnrow"><button class="btn ghost small" data-act="discord-refresh">↻ Refresh</button></div></div>
+        ${channelsCard}
+        ${msgsCard}`;
+      }
+      return `<div class="card"><p class="muted">Discord লোড হচ্ছে…</p></div>`;
     },
   },
 };
@@ -3102,11 +3272,12 @@ const ACTS = {
   'gh-refresh'() { state.github = { status: 'idle' }; render(); },
   'github-signin'() { startGitHubSignIn(); },
   'conn-worker'(el) {
-    // Worker-backed connectors (Notion, Slack, Dropbox, Telegram): Open shows the in-app module.
+    // Worker-backed connectors (Notion, Slack, Dropbox, Telegram, Discord): Open shows the in-app module.
     if (el.dataset.v === 'notion') openModule('notion');
     if (el.dataset.v === 'slack') openModule('slack');
     if (el.dataset.v === 'dropbox') openModule('dropbox');
     if (el.dataset.v === 'telegram') openModule('telegram');
+    if (el.dataset.v === 'discord') openModule('discord');
   },
   'notion-refresh'() { state.notion = { status: 'idle' }; render(); },
   'notion-open-site'() { openConnUrl('https://www.notion.so'); },
@@ -3172,6 +3343,27 @@ const ACTS = {
     render();
   },
   'telegram-send'() { sendTelegramMessage(); },
+  'discord-refresh'() { state.discord = { status: 'idle' }; render(); },
+  'discord-open-site'() { openConnUrl('https://discord.com'); },
+  'discord-guild'(el) {
+    const id = (el.dataset.v || '').trim();
+    if (!id) return;
+    loadDiscordChannels(id);
+  },
+  'discord-back-guild'() {
+    state.discord = { ...state.discord, selectedGuild: null, channels: null, channelsStatus: 'idle', selectedChannel: null, messages: null, msgsStatus: 'idle' };
+    render();
+  },
+  'discord-channel'(el) {
+    const id = (el.dataset.v || '').trim();
+    if (!id) return;
+    loadDiscordMessages(id);
+  },
+  'discord-back-channel'() {
+    state.discord = { ...state.discord, selectedChannel: null, messages: null, msgsStatus: 'idle' };
+    render();
+  },
+  'discord-send'() { sendDiscordMessage(); },
   'google-signin'() { startGoogleSignIn(); },
   'google-signout'() { googleSignOut(); },
   'wf-toggle'(el) { const w = store.get('workflows', []); const it = w.find(x => x.id === el.dataset.id); if (it) { it.on = !it.on; store.set('workflows', w); render(); } },
