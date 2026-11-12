@@ -20,6 +20,11 @@
 //                       Telegram app (t.me/BotFather → /newbot). The bot only
 //                       sees messages sent after it was messaged or added to
 //                       a group; old history is never visible to it.
+//   DISCORD_BOT_TOKEN   — NEW: the bot token of the Discord app for Kira
+//                       Clone (discord.com/developers → Applications →
+//                       Bot → Reset Token). The bot only sees servers it
+//                       was invited to (OAuth2 → URL Generator → bot
+//                       scope); the app never sees the token.
 //
 // App contract (~/workspace/kira-clone/src/main.js):
 //   GitHub: POST { provider:'github', code, redirect_uri } -> { access_token, ... }
@@ -46,6 +51,13 @@
 //            leading slash; GET params ride in `body` and are turned into
 //            a query string server-side; if TELEGRAM_BOT_TOKEN is missing,
 //            reply { error:'not_configured' }.)
+//   Discord: POST { provider:'discord', path, method, body } -> Discord API JSON
+//           (app calls /users/@me/guilds GET, /guilds/{id}/channels GET
+//            and /channels/{id}/messages GET/POST; path is the Discord
+//            API path WITH a leading slash; GET params ride in `body`
+//            and are turned into a query string server-side; calls use
+//            `Authorization: Bot <DISCORD_BOT_TOKEN>`; if the token is
+//            missing, reply { error:'not_configured' }.)
 
 const GITHUB_CLIENT_ID = 'Ov23licDE7nLwFTa3Tky';
 const NOTION_VERSION = '2022-06-28';
@@ -191,6 +203,33 @@ export default {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) return json({ error: data.description || 'telegram_error', status: res.status }, res.status);
       if (data && data.ok === false) return json({ error: data.description || 'telegram_error' }, 400);
+      return json(data);
+    }
+
+    if (payload.provider === 'discord') {
+      if (!env.DISCORD_BOT_TOKEN) return json({ error: 'not_configured' });
+      const path = String(payload.path || '/users/@me/guilds');
+      if (!path.startsWith('/')) return json({ error: 'bad_path' }, 400);
+      let url = 'https://discord.com/api/v10' + path;
+      // GET calls carry their params in `body` — turn them into a query string.
+      if ((payload.method || 'GET') === 'GET' && payload.body && typeof payload.body === 'object') {
+        const qs = new URLSearchParams();
+        for (const [k, v] of Object.entries(payload.body)) {
+          if (v !== undefined && v !== null) qs.set(k, String(v));
+        }
+        const s = qs.toString();
+        if (s) url += (url.includes('?') ? '&' : '?') + s;
+      }
+      const res = await fetch(url, {
+        method: payload.method || 'GET',
+        headers: {
+          Authorization: 'Bot ' + env.DISCORD_BOT_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: payload.method === 'POST' && payload.body ? JSON.stringify(payload.body) : undefined,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return json({ error: data.message || 'discord_error', status: res.status }, res.status);
       return json(data);
     }
 
